@@ -9,6 +9,7 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::ops::BitOrAssign;
+use std::path::PathBuf;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -33,7 +34,9 @@ use remain::sorted;
 use thiserror::Error;
 use vm_memory::GuestMemory;
 
+mod swtpm;
 mod vtpm_proxy;
+use self::swtpm::Swtpm;
 pub use self::vtpm_proxy::VtpmProxy;
 
 // A single queue of size 2. The guest kernel driver will enqueue a single
@@ -54,6 +57,10 @@ struct Worker {
 
 pub trait TpmBackend: Send {
     fn execute_command<'a>(&'a mut self, command: &[u8]) -> &'a [u8];
+
+    fn keep_rds(&self) -> Vec<RawDescriptor> {
+        Vec::new()
+    }
 }
 
 impl Worker {
@@ -160,7 +167,10 @@ impl Tpm {
 
 impl VirtioDevice for Tpm {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
-        Vec::new()
+        self.backend
+            .as_ref()
+            .map(|backend| backend.keep_rds())
+            .unwrap_or_default()
     }
 
     fn device_type(&self) -> DeviceType {
@@ -234,14 +244,32 @@ enum Error {
     Write(io::Error),
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+enum TpmBackendConfig {
+    #[default]
+    VtpmProxy,
+    Swtpm {
+        socket: PathBuf,
+    },
+}
+
 /// Module for creating a Virtio TPM device.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
-pub struct VirtioTpmModule;
+pub struct VirtioTpmModule {
+    backend: TpmBackendConfig,
+}
 
 impl VirtioTpmModule {
     /// Create a new VirtioTpmModule.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Create a VirtioTpmModule backed by an swtpm Unix control socket.
+    pub fn new_swtpm(socket: PathBuf) -> Self {
+        Self {
+            backend: TpmBackendConfig::Swtpm { socket },
+        }
     }
 }
 
@@ -251,25 +279,33 @@ impl VirtioDeviceModule for VirtioTpmModule {
     }
 
     fn create(&self, args: &mut VirtioDeviceArgs<'_>) -> anyhow::Result<Box<dyn VirtioDevice>> {
-        let backend = VtpmProxy::new();
-        let dev = Tpm::new(
-            Box::new(backend),
-            virtio::base_features(args.protection_type),
-        );
+        let backend: Box<dyn TpmBackend> = match &self.backend {
+            TpmBackendConfig::VtpmProxy => Box::new(VtpmProxy::new()),
+            TpmBackendConfig::Swtpm { socket } => Box::new(Swtpm::connect(socket)?),
+        };
+        let dev = Tpm::new(backend, virtio::base_features(args.protection_type));
         Ok(Box::new(dev))
     }
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
     fn create_jail(&self, jail_config: &JailConfig) -> anyhow::Result<Option<Minijail>> {
-        let mut config = jail::SandboxConfig::new(jail_config, "vtpm_proxy_device");
-        config.bind_mounts = true;
+        let use_dbus = matches!(self.backend, TpmBackendConfig::VtpmProxy);
+        let device_name = if use_dbus {
+            "vtpm_proxy_device"
+        } else {
+            "swtpm_device"
+        };
+        let mut config = jail::SandboxConfig::new(jail_config, device_name);
+        config.bind_mounts = use_dbus;
         let mut jail = jail::create_sandbox_minijail(
             &jail_config.pivot_root,
             jail::MAX_OPEN_FILES_DEFAULT,
             &config,
         )?;
-        let system_bus_socket_path = std::path::Path::new("/run/dbus/system_bus_socket");
-        jail.mount_bind(system_bus_socket_path, system_bus_socket_path, true)?;
+        if use_dbus {
+            let system_bus_socket_path = std::path::Path::new("/run/dbus/system_bus_socket");
+            jail.mount_bind(system_bus_socket_path, system_bus_socket_path, true)?;
+        }
         Ok(Some(jail))
     }
 }

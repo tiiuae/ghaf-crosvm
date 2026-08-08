@@ -2049,6 +2049,11 @@ pub struct RunCommand {
     /// path to a socket from where to read switch input events and write status updates to
     pub switches: Vec<PathBuf>,
 
+    #[cfg(feature = "vtpm")]
+    #[argh(option, arg_name = "PATH")]
+    /// enable virtio-tpm backed by an swtpm Unix control socket
+    pub swtpm: Option<PathBuf>,
+
     #[argh(option, arg_name = "TAG")]
     /// (DEPRECATED): Use --syslog-tag before "run".
     /// when logging to syslog, use the provided tag
@@ -2730,9 +2735,17 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(feature = "vtpm")]
         {
-            if cmd.vtpm_proxy.unwrap_or_default() {
+            let use_vtpm_proxy = cmd.vtpm_proxy.unwrap_or_default();
+            if use_vtpm_proxy && cmd.swtpm.is_some() {
+                return Err("`vtpm-proxy` and `swtpm` cannot be specified together".to_string());
+            }
+            if use_vtpm_proxy {
                 cfg.virtio_device_modules
                     .push(device_virtio_tpm::VirtioTpmModule::new().into());
+            }
+            if let Some(socket) = cmd.swtpm {
+                cfg.virtio_device_modules
+                    .push(device_virtio_tpm::VirtioTpmModule::new_swtpm(socket).into());
             }
         }
 
@@ -3295,6 +3308,29 @@ mod tests {
         assert_eq!(format_disk_letter("/dev/sd", 701), "/dev/sdzz");
         assert_eq!(format_disk_letter("/dev/sd", 702), "/dev/sdaaa");
         assert_eq!(format_disk_letter("/dev/sd", 703), "/dev/sdaab");
+    }
+
+    #[cfg(feature = "vtpm")]
+    #[test]
+    fn parse_swtpm_cli() {
+        use argh::FromArgs;
+
+        let cmd = RunCommand::from_args(&[], &["--swtpm", "/run/swtpm.sock", "/dev/null"]).unwrap();
+        assert_eq!(cmd.swtpm, Some(PathBuf::from("/run/swtpm.sock")));
+
+        let cmd = RunCommand::from_args(
+            &[],
+            &["--vtpm-proxy", "--swtpm", "/run/swtpm.sock", "/dev/null"],
+        )
+        .unwrap();
+        let error = match crate::crosvm::config::Config::try_from(cmd) {
+            Ok(_) => panic!("accepted mutually exclusive vTPM backends"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "`vtpm-proxy` and `swtpm` cannot be specified together"
+        );
     }
 
     #[test]
