@@ -2930,8 +2930,24 @@ fn removable_vfio_slot(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn removable_vfio_group_is_complete(
+    host_addr: PciAddress,
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
+    mut is_attached: impl FnMut(PciAddress) -> bool,
+) -> bool {
+    let Some(slot) = removable_vfio_slots.get(&host_addr) else {
+        return true;
+    };
+
+    removable_vfio_slots
+        .iter()
+        .filter(|(_, group_slot)| group_slot.bus == slot.bus)
+        .all(|(group_host_addr, _)| is_attached(*group_host_addr))
+}
+
+#[cfg(target_arch = "x86_64")]
 fn wait_for_hotplug_event(event: Event, operation: &str) -> Result<()> {
-    match event.wait_timeout(Duration::from_secs(15))? {
+    match event.wait_timeout(Duration::from_secs(30))? {
         EventWaitResult::Signaled => Ok(()),
         EventWaitResult::TimedOut => bail!("timed out waiting for guest to complete {operation}"),
     }
@@ -3074,7 +3090,18 @@ fn add_hotplug_device(
     let completion_event = {
         let mut hp_bus = hp_bus.lock();
         hp_bus.add_hotplug_device(hotplug_key, pci_address);
-        if device.hp_interrupt {
+        // A removable IOMMU group shares one physical slot in the guest.  Register every
+        // function before notifying the guest so Linux discovers the complete multifunction
+        // device in one scan instead of interpreting each function as another button press.
+        let group_complete =
+            removable_vfio_group_is_complete(host_addr, removable_vfio_slots, |group_host_addr| {
+                hp_bus
+                    .get_hotplug_device(HotPlugKey::HostVfio {
+                        host_addr: group_host_addr,
+                    })
+                    .is_some()
+            });
+        if device.hp_interrupt && group_complete {
             hp_bus.hot_plug(pci_address)?
         } else {
             None
@@ -5718,6 +5745,7 @@ pub fn setup_emulator_crash_reporting(_cfg: &Config) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use arch::CpuSet;
@@ -5747,6 +5775,47 @@ mod tests {
             })
         );
         assert_eq!(removable_vfio_slot(unrelated_addr, &slots), None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removable_vfio_group_waits_for_every_member() {
+        let first = PciAddress::new(0, 0, 31, 0).unwrap();
+        let second = PciAddress::new(0, 0, 31, 3).unwrap();
+        let third = PciAddress::new(0, 0, 31, 4).unwrap();
+        let slots = BTreeMap::from([
+            (
+                first,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: PciAddress::new(0, 7, 0, 0).unwrap(),
+                },
+            ),
+            (
+                second,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: PciAddress::new(0, 7, 0, 1).unwrap(),
+                },
+            ),
+            (
+                third,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: PciAddress::new(0, 7, 0, 2).unwrap(),
+                },
+            ),
+        ]);
+
+        let attached = BTreeSet::from([first, second]);
+        assert!(!removable_vfio_group_is_complete(first, &slots, |addr| {
+            attached.contains(&addr)
+        }));
+
+        let attached = BTreeSet::from([first, second, third]);
+        assert!(removable_vfio_group_is_complete(first, &slots, |addr| {
+            attached.contains(&addr)
+        }));
     }
 
     #[cfg(target_arch = "x86_64")]
