@@ -1174,7 +1174,7 @@ impl VfioPciDevice {
             // these bars should be trapped, so that msix could be emulated.
             let mut mmaps = self.device.get_region_mmap(index);
 
-            if self.msix_cap.is_some() && !self.device.get_region_msix_mmappable(index) {
+            if self.msix_cap.is_some() && !self.device.preserve_region_sparse_mmaps(index) {
                 mmaps = self.remove_bar_mmap_msix(index, mmaps);
             }
             if mmaps.is_empty() {

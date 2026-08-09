@@ -990,9 +990,13 @@ pub struct VfioRegion {
     mmaps: Vec<vfio_region_sparse_mmap_area>,
     // type and subtype for cap type
     cap_info: Option<(u32, u32)>,
-    // if true, then the caller can safely mmap the MSIX region
-    // if false, the caller should remove the MSIX part of the region before mmapping
-    msix_region_mmappable: bool,
+    // Preserve driver-provided sparse mappings exactly. This is required by some mediated
+    // devices, such as NVIDIA vGPUs, even when a sparse area overlaps MSI-X data.
+    preserve_sparse_mmaps: bool,
+}
+
+fn region_cap_preserves_sparse_mmaps(cap_id: u32) -> bool {
+    cap_id == VFIO_REGION_INFO_CAP_SPARSE_MMAP
 }
 
 /// Vfio device for exposing regions which could be read/write to kernel vfio device.
@@ -1603,7 +1607,7 @@ impl VfioDevice {
 
             let mut mmaps: Vec<vfio_region_sparse_mmap_area> = Vec::new();
             let mut cap_info: Option<(u32, u32)> = None;
-            let mut msix_region_mmappable = false;
+            let mut preserve_sparse_mmaps = false;
             if reg_info.argsz > argsz {
                 let cap_len: usize = (reg_info.argsz - argsz) as usize;
                 let mut region_with_cap =
@@ -1688,12 +1692,8 @@ impl VfioDevice {
                         for area in areas.iter() {
                             mmaps.push(*area);
                         }
-
-                        // Sparse regions means the driver can decide which parts of the BAR are
-                        // safe to mmap. If that overlaps with the MSIX
-                        // data, that's the decision of the driver.
-                        // This is required for some devices (e.g. NVIDIA vGPUs).
-                        msix_region_mmappable = true;
+                        preserve_sparse_mmaps |=
+                            region_cap_preserves_sparse_mmaps(cap_header.id as u32);
                     } else if cap_header.id as u32 == VFIO_REGION_INFO_CAP_TYPE {
                         if offset + type_cap_sz > region_info_sz {
                             break;
@@ -1707,11 +1707,13 @@ impl VfioDevice {
 
                         cap_info = Some((cap_type_info.type_, cap_type_info.subtype));
                     } else if cap_header.id as u32 == VFIO_REGION_INFO_CAP_MSIX_MAPPABLE {
+                        // This capability allows access to non-MSI-X registers which share a host
+                        // page with MSI-X data. VFIO_DEVICE_SET_IRQS is still required, so the
+                        // MSI-X table and PBA must remain trapped by the VMM.
                         mmaps.push(vfio_region_sparse_mmap_area {
                             offset: 0,
                             size: region_with_cap[0].region_info.size,
                         });
-                        msix_region_mmappable = true;
                     }
 
                     offset = cap_header.next;
@@ -1729,7 +1731,7 @@ impl VfioDevice {
                 offset: reg_info.offset,
                 mmaps,
                 cap_info,
-                msix_region_mmappable,
+                preserve_sparse_mmaps,
             };
             regions.push(region);
         }
@@ -1794,13 +1796,12 @@ impl VfioDevice {
         }
     }
 
-    /// get if the MSIX data with a region is safe to mmap, or if it should be removed
-    /// before mmapping
-    pub fn get_region_msix_mmappable(&self, index: usize) -> bool {
+    /// Return whether driver-provided sparse mappings must be preserved exactly.
+    pub fn preserve_region_sparse_mmaps(&self, index: usize) -> bool {
         match self.regions.get(index) {
-            Some(v) => v.msix_region_mmappable,
+            Some(v) => v.preserve_sparse_mmaps,
             None => {
-                warn!("get_region_msix_mmappable with invalid index: {}", index);
+                warn!("preserve_region_sparse_mmaps with invalid index: {}", index);
                 false
             }
         }
@@ -2021,5 +2022,22 @@ impl VfioPciConfig {
 impl AsRawDescriptor for VfioDevice {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.dev.as_raw_descriptor()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::region_cap_preserves_sparse_mmaps;
+    use vfio_sys::VFIO_REGION_INFO_CAP_MSIX_MAPPABLE;
+    use vfio_sys::VFIO_REGION_INFO_CAP_SPARSE_MMAP;
+
+    #[test]
+    fn only_sparse_region_caps_preserve_msix_mappings() {
+        assert!(region_cap_preserves_sparse_mmaps(
+            VFIO_REGION_INFO_CAP_SPARSE_MMAP
+        ));
+        assert!(!region_cap_preserves_sparse_mmaps(
+            VFIO_REGION_INFO_CAP_MSIX_MAPPABLE
+        ));
     }
 }
