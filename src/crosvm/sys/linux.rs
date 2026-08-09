@@ -2890,6 +2890,11 @@ fn start_pci_root_worker(
                 PciRootCommand::Remove(addr) => {
                     pci_root.lock().remove_device(addr);
                 }
+                PciRootCommand::Barrier(event) => {
+                    if let Err(e) = event.signal() {
+                        error!("failed to signal PCI root barrier: {}", e);
+                    }
+                }
                 PciRootCommand::Kill => break,
             },
             Err(e) => {
@@ -2954,9 +2959,18 @@ fn wait_for_hotplug_event(event: Event, operation: &str) -> Result<()> {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn wait_for_pci_root_updates(hp_control_tube: &mpsc::Sender<PciRootCommand>) -> Result<()> {
+    let event = Event::new().context("failed to create PCI root barrier")?;
+    hp_control_tube
+        .send(PciRootCommand::Barrier(event.try_clone()?))
+        .context("failed to send PCI root barrier")?;
+    wait_for_hotplug_event(event, "PCI root update")
+}
+
+#[cfg(target_arch = "x86_64")]
 fn add_hotplug_device(
     linux: &mut RunnableLinuxVm,
-    sys_allocator: &mut SystemAllocator,
+    sys_allocator: &Arc<Mutex<SystemAllocator>>,
     cfg: &Config,
     add_control_tube: &mut impl FnMut(AnyControlTube),
     hp_control_tube: &mpsc::Sender<PciRootCommand>,
@@ -2976,6 +2990,7 @@ fn add_hotplug_device(
 
     let (hotplug_key, pci_address) = match device.device_type {
         HotPlugDeviceType::UpstreamPort | HotPlugDeviceType::DownstreamPort => {
+            let mut sys_allocator = sys_allocator.lock();
             let (vm_host_tube, vm_device_tube) = Tube::pair().context("failed to create tube")?;
             add_control_tube(AnyControlTube::Vm(vm_host_tube));
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -3016,7 +3031,7 @@ fn add_hotplug_device(
                 linux,
                 pci_bridge,
                 None,
-                sys_allocator,
+                &mut sys_allocator,
                 hp_control_tube,
                 #[cfg(feature = "swap")]
                 swap_controller,
@@ -3031,37 +3046,43 @@ fn add_hotplug_device(
             // back to the host BDF (usually bus 0), which is outside the virtio-IOMMU hotplug
             // ranges and also leaves a failed PCI reservation behind for subsequent retries.
             let removable_slot = removable_vfio_slot(host_addr, removable_vfio_slots);
-            let (vfio_device, jail, viommu_mapper) = create_vfio_device(
-                cfg.jail_config.as_ref(),
-                &*linux.vm,
-                sys_allocator,
-                add_control_tube,
-                &device.path,
-                true,
-                removable_slot.map(|slot| slot.bus),
-                removable_slot.map(|slot| slot.guest_address),
-                None,
-                if iommu_host_tube.is_some() {
-                    IommuDevType::VirtioIommu
-                } else {
-                    IommuDevType::NoIommu
-                },
-                None,
-                vfio_container_manager,
-            )?;
-            let vfio_pci_device = match vfio_device {
-                VfioDeviceVariant::Pci(pci) => Box::new(pci),
-                VfioDeviceVariant::Platform(_) => bail!("vfio platform hotplug not supported"),
+            let (pci_address, viommu_mapper) = {
+                let mut sys_allocator = sys_allocator.lock();
+                let (vfio_device, jail, viommu_mapper) = create_vfio_device(
+                    cfg.jail_config.as_ref(),
+                    &*linux.vm,
+                    &mut sys_allocator,
+                    add_control_tube,
+                    &device.path,
+                    true,
+                    removable_slot.map(|slot| slot.bus),
+                    removable_slot.map(|slot| slot.guest_address),
+                    None,
+                    if iommu_host_tube.is_some() {
+                        IommuDevType::VirtioIommu
+                    } else {
+                        IommuDevType::NoIommu
+                    },
+                    None,
+                    vfio_container_manager,
+                )?;
+                let vfio_pci_device = match vfio_device {
+                    VfioDeviceVariant::Pci(pci) => Box::new(pci),
+                    VfioDeviceVariant::Platform(_) => {
+                        bail!("vfio platform hotplug not supported")
+                    }
+                };
+                let pci_address = Arch::register_pci_device(
+                    linux,
+                    vfio_pci_device,
+                    jail,
+                    &mut sys_allocator,
+                    hp_control_tube,
+                    #[cfg(feature = "swap")]
+                    swap_controller,
+                )?;
+                (pci_address, viommu_mapper)
             };
-            let pci_address = Arch::register_pci_device(
-                linux,
-                vfio_pci_device,
-                jail,
-                sys_allocator,
-                hp_control_tube,
-                #[cfg(feature = "swap")]
-                swap_controller,
-            )?;
             if let Some(iommu_host_tube) = iommu_host_tube {
                 let endpoint_addr = pci_address.to_u32();
                 let vfio_wrapper = viommu_mapper.context("expected mapper")?;
@@ -3087,6 +3108,11 @@ fn add_hotplug_device(
             (hotplug_key, pci_address)
         }
     };
+    // Device registration is processed asynchronously by the PCI root worker.  Wait until it has
+    // also completed any VM-memory request for the ECAM mapping before notifying the guest.  The
+    // allocator must remain unlocked here because the VM-memory handler needs it to service that
+    // request.
+    wait_for_pci_root_updates(hp_control_tube)?;
     let completion_event = {
         let mut hp_bus = hp_bus.lock();
         hp_bus.add_hotplug_device(hotplug_key, pci_address);
@@ -3251,7 +3277,7 @@ fn remove_hotplug_bridge(
 #[cfg(target_arch = "x86_64")]
 fn remove_hotplug_device(
     linux: &mut RunnableLinuxVm,
-    sys_allocator: &mut SystemAllocator,
+    sys_allocator: &Arc<Mutex<SystemAllocator>>,
     iommu_host_tube: Option<&Tube>,
     device: &HotPlugDeviceInfo,
     removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
@@ -3306,11 +3332,14 @@ fn remove_hotplug_device(
                 }
             }
         }
+        let mut sys_allocator = sys_allocator.lock();
         for group_pci_addr in group_devices {
             sys_allocator.release_pci(group_pci_addr);
         }
         return Ok(());
     }
+
+    let mut sys_allocator = sys_allocator.lock();
 
     let hp_bus = linux
         .hotplug_bus
@@ -3370,7 +3399,7 @@ fn remove_hotplug_device(
                     removed_key = Some(hotplug_key);
                     remove_hotplug_bridge(
                         linux,
-                        sys_allocator,
+                        &mut sys_allocator,
                         &mut buses_to_remove,
                         hotplug_key,
                         bus_num,
@@ -3393,7 +3422,7 @@ fn remove_hotplug_device(
                         if addr_alias.bus == host_addr.bus && hp_bus_lock.is_empty() {
                             remove_hotplug_bridge(
                                 linux,
-                                sys_allocator,
+                                &mut sys_allocator,
                                 &mut buses_to_remove,
                                 hotplug_key.unwrap(),
                                 *simbling_bus_num,
@@ -3503,7 +3532,7 @@ fn send_pvclock_cmd(tube: &Tube, command: PvClockCommand) -> Result<Option<PvClo
 #[cfg(target_arch = "x86_64")]
 fn handle_hotplug_command(
     linux: &mut RunnableLinuxVm,
-    sys_allocator: &mut SystemAllocator,
+    sys_allocator: &Arc<Mutex<SystemAllocator>>,
     cfg: &Config,
     add_control_tube: &mut impl FnMut(AnyControlTube),
     hp_control_tube: &mpsc::Sender<PciRootCommand>,
@@ -3651,7 +3680,7 @@ fn process_vm_request(
             {
                 let response = handle_hotplug_command(
                     state.linux,
-                    &mut state.sys_allocator.lock(),
+                    state.sys_allocator,
                     state.cfg,
                     &mut add_control_tube,
                     state.hp_control_tube,
