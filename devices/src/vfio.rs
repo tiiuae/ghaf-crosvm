@@ -350,11 +350,18 @@ impl VfioContainer {
             .open("/dev/vfio/vfio")
             .map_err(VfioError::OpenContainer)?;
 
-        Self::new_from_container(container)
+        Self::new_with_iommu_type(container, None)
     }
 
-    // Construct a VfioContainer from an exist container file.
+    // Construct a VfioContainer from an existing, already configured container file.
     pub fn new_from_container(container: File) -> Result<Self> {
+        // Hotplug passes a duplicate of a Type1 container that has already had VFIO_SET_IOMMU
+        // applied.  The duplicate shares that kernel state, so remember it locally instead of
+        // treating the imported descriptor as an unconfigured new container.
+        Self::new_with_iommu_type(container, Some(IommuType::Type1V2))
+    }
+
+    fn new_with_iommu_type(container: File, iommu_type: Option<IommuType>) -> Result<Self> {
         // SAFETY:
         // Safe as file is vfio container descriptor and ioctl is defined by kernel.
         let version = unsafe { ioctl(&container, VFIO_GET_API_VERSION) };
@@ -365,7 +372,7 @@ impl VfioContainer {
         Ok(VfioContainer {
             container,
             groups: HashMap::new(),
-            iommu_type: None,
+            iommu_type,
         })
     }
 
@@ -407,10 +414,7 @@ impl VfioContainer {
         user_addr: u64,
         write_en: bool,
     ) -> Result<()> {
-        match self
-            .iommu_type
-            .expect("vfio_dma_map called before configuring IOMMU")
-        {
+        match self.iommu_type.ok_or(VfioError::InvalidOperation)? {
             IommuType::Type1V2 | IommuType::Type1ChromeOS => {
                 self.vfio_iommu_type1_dma_map(iova, size, user_addr, write_en)
             }
@@ -449,10 +453,7 @@ impl VfioContainer {
     }
 
     pub fn vfio_dma_unmap(&self, iova: u64, size: u64) -> Result<()> {
-        match self
-            .iommu_type
-            .expect("vfio_dma_unmap called before configuring IOMMU")
-        {
+        match self.iommu_type.ok_or(VfioError::InvalidOperation)? {
             IommuType::Type1V2 | IommuType::Type1ChromeOS => {
                 self.vfio_iommu_type1_dma_unmap(iova, size)
             }
@@ -481,10 +482,7 @@ impl VfioContainer {
     }
 
     pub fn vfio_get_iommu_page_size_mask(&self) -> Result<u64> {
-        match self
-            .iommu_type
-            .expect("vfio_get_iommu_page_size_mask called before configuring IOMMU")
-        {
+        match self.iommu_type.ok_or(VfioError::InvalidOperation)? {
             IommuType::Type1V2 | IommuType::Type1ChromeOS => {
                 self.vfio_iommu_type1_get_iommu_page_size_mask()
             }
@@ -512,10 +510,7 @@ impl VfioContainer {
     }
 
     pub fn vfio_iommu_iova_get_iova_ranges(&self) -> Result<Vec<AddressRange>> {
-        match self
-            .iommu_type
-            .expect("vfio_iommu_iova_get_iova_ranges called before configuring IOMMU")
-        {
+        match self.iommu_type.ok_or(VfioError::InvalidOperation)? {
             IommuType::Type1V2 | IommuType::Type1ChromeOS => {
                 self.vfio_iommu_type1_get_iova_ranges()
             }
@@ -2027,9 +2022,29 @@ impl AsRawDescriptor for VfioDevice {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::fs::File;
+
     use super::region_cap_preserves_sparse_mmaps;
+    use super::VfioContainer;
+    use super::VfioError;
     use vfio_sys::VFIO_REGION_INFO_CAP_MSIX_MAPPABLE;
     use vfio_sys::VFIO_REGION_INFO_CAP_SPARSE_MMAP;
+
+    #[test]
+    fn unconfigured_container_rejects_dma_map_without_panicking() {
+        let container = VfioContainer {
+            container: File::open("/dev/null").unwrap(),
+            groups: HashMap::new(),
+            iommu_type: None,
+        };
+
+        // SAFETY: The missing IOMMU configuration is rejected before any ioctl uses these dummy
+        // addresses.
+        let result = unsafe { container.vfio_dma_map(0, 4096, 0, false) };
+
+        assert!(matches!(result, Err(VfioError::InvalidOperation)));
+    }
 
     #[test]
     fn only_sparse_region_caps_preserve_msix_mappings() {
