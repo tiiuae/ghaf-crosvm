@@ -2368,6 +2368,7 @@ dependencies = [
  "protobuf",
  "remain",
  "system_api",
+ "tempfile",
  "thiserror 1.0.38",
 ]
 

@@ -188,6 +188,13 @@ impl HotPlugBus for PcieRootPort {
         self.downstream_devices.insert(guest_addr, hotplug_key);
     }
 
+    fn add_hotplug_device_at_boot(&mut self, hotplug_key: HotPlugKey, guest_addr: PciAddress) {
+        self.add_hotplug_device(hotplug_key, guest_addr);
+        if self.downstream_devices.contains_key(&guest_addr) {
+            self.pcie_port.set_slot_status(PCIE_SLTSTA_PDS);
+        }
+    }
+
     fn get_hotplug_device(&self, hotplug_key: HotPlugKey) -> Option<PciAddress> {
         for (guest_address, host_info) in self.downstream_devices.iter() {
             if hotplug_key == *host_info {
@@ -209,5 +216,24 @@ impl HotPlugBus for PcieRootPort {
 impl PmeNotify for PcieRootPort {
     fn notify(&mut self, requester_id: u16) {
         self.pcie_port.inject_pme(requester_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coldplug_device_is_present_without_pending_event() {
+        let mut root_port = PcieRootPort::new(1, true);
+        let host_addr = PciAddress::new(0, 0, 20, 3).unwrap();
+        let guest_addr = PciAddress::new(0, 1, 0, 0).unwrap();
+        let key = HotPlugKey::HostVfio { host_addr };
+
+        root_port.add_hotplug_device_at_boot(key, guest_addr);
+
+        assert_eq!(root_port.get_hotplug_device(key), Some(guest_addr));
+        assert_ne!(root_port.pcie_port.slot_status() & PCIE_SLTSTA_PDS, 0);
+        assert!(!root_port.pcie_port.is_hpc_pending());
     }
 }

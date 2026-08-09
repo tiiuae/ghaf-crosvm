@@ -1645,6 +1645,8 @@ pub enum VmRequest {
         device: HotPlugDeviceInfo,
         add: bool,
     },
+    /// Return host sysfs paths for all currently attached VFIO devices.
+    ListVfioDevices,
     /// Command to add/remove network tap device as virtio-pci device
     #[cfg(feature = "pci-hotplug")]
     HotPlugNetCommand(NetControlCommand),
@@ -2370,6 +2372,7 @@ impl VmRequest {
                 }
             },
             VmRequest::HotPlugVfioCommand { device: _, add: _ } => VmResponse::Ok,
+            VmRequest::ListVfioDevices => VmResponse::VfioDevicePaths(Vec::new()),
             #[cfg(feature = "pci-hotplug")]
             VmRequest::HotPlugNetCommand(ref _net_cmd) => {
                 VmResponse::ErrString("hot plug not supported".to_owned())
@@ -2750,6 +2753,8 @@ pub enum VmResponse {
     /// Results of PCI hot plug
     #[cfg(feature = "pci-hotplug")]
     PciHotPlugResponse { bus: u8 },
+    /// Host sysfs paths for attached VFIO devices.
+    VfioDevicePaths(Vec<PathBuf>),
     /// Results of usb control commands.
     UsbResponse(UsbControlResult),
     /// Results of gpu control commands.
@@ -2808,6 +2813,14 @@ impl Display for VmResponse {
             UsbResponse(result) => write!(f, "usb control request get result {result:?}"),
             #[cfg(feature = "pci-hotplug")]
             PciHotPlugResponse { bus } => write!(f, "pci hotplug bus {bus:?}"),
+            VfioDevicePaths(paths) => write!(
+                f,
+                "devices{}",
+                paths
+                    .iter()
+                    .map(|path| format!(" {}", path.display()))
+                    .collect::<String>()
+            ),
             GpuResponse(result) => write!(f, "gpu control request result {result:?}"),
             BatResponse(result) => write!(f, "{result}"),
             SwapStatus(status) => {

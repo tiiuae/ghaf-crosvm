@@ -387,6 +387,11 @@ impl PciePort {
         self.pcie_config.lock().set_slot_status(flag);
     }
 
+    #[cfg(test)]
+    pub fn slot_status(&self) -> u16 {
+        self.pcie_config.lock().slot_status
+    }
+
     pub fn should_trigger_pme(&mut self) -> bool {
         self.pm_config.lock().should_trigger_pme()
     }
