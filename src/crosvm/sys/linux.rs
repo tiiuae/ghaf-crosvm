@@ -1333,6 +1333,31 @@ fn removable_vfio_group(path: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn removable_vfio_root_port_aliases(
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
+    root_port_addresses: &BTreeMap<u8, PciAddress>,
+    iommu_endpoints: &BTreeSet<u32>,
+) -> Result<Vec<(u32, u32)>> {
+    let mut mapper_endpoint_by_bus = BTreeMap::new();
+    for slot in removable_vfio_slots.values() {
+        let endpoint = slot.guest_address.to_u32();
+        if iommu_endpoints.contains(&endpoint) {
+            mapper_endpoint_by_bus.entry(slot.bus).or_insert(endpoint);
+        }
+    }
+
+    mapper_endpoint_by_bus
+        .into_iter()
+        .map(|(bus, mapper_endpoint)| {
+            let root_port = root_port_addresses
+                .get(&bus)
+                .with_context(|| format!("missing address for removable VFIO root port {bus}"))?;
+            Ok((root_port.to_u32(), mapper_endpoint))
+        })
+        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
 impl HotPlugStub {
     /// Constructs empty HotPlugStub.
     fn new() -> Self {
@@ -2526,6 +2551,39 @@ fn run_vm(
     let mut devices = created_devices;
 
     arch::assign_pci_addresses(&mut devices, &mut sys_allocator)?;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let root_port_addresses = hp_stub
+            .hotplug_buses
+            .iter()
+            .map(|(bus, hotplug_bus)| {
+                let address = hotplug_bus.lock().get_address().with_context(|| {
+                    format!("removable VFIO root port {bus} has no PCI address")
+                })?;
+                Ok((*bus, address))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let iommu_endpoints = iommu_attached_endpoints.keys().copied().collect();
+        let aliases = removable_vfio_root_port_aliases(
+            &removable_vfio_slots,
+            &root_port_addresses,
+            &iommu_endpoints,
+        )?;
+
+        // Linux groups downstream functions with a non-ACS root port only when the root port is
+        // also managed by the IOMMU. Reuse the host VFIO group's mapper for that root port so all
+        // functions attach to one guest domain instead of competing domains for the same mapper.
+        for (root_port, mapper_endpoint) in aliases {
+            let mapper = iommu_attached_endpoints
+                .get(&mapper_endpoint)
+                .context("missing removable VFIO mapper endpoint")?
+                .clone();
+            if iommu_attached_endpoints.insert(root_port, mapper).is_some() {
+                bail!("removable VFIO root port {root_port:#x} is already an IOMMU endpoint");
+            }
+        }
+    }
 
     let pci_devices: Vec<&dyn PciDevice> = devices
         .iter()
@@ -5910,6 +5968,59 @@ mod tests {
         assert!(range.contains(&PciAddress::new(0, 7, 31, 7).unwrap().to_u32()));
         assert!(!range.contains(&PciAddress::new(0, 6, 31, 7).unwrap().to_u32()));
         assert!(!range.contains(&PciAddress::new(0, 8, 0, 0).unwrap().to_u32()));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removable_vfio_group_aliases_one_mapper_to_its_root_port() {
+        let first_host = PciAddress::new(0, 0, 31, 0).unwrap();
+        let second_host = PciAddress::new(0, 0, 31, 3).unwrap();
+        let first_guest = PciAddress::new(0, 7, 0, 0).unwrap();
+        let second_guest = PciAddress::new(0, 7, 0, 1).unwrap();
+        let root_port = PciAddress::new(0, 0, 1, 0).unwrap();
+        let slots = BTreeMap::from([
+            (
+                first_host,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: first_guest,
+                },
+            ),
+            (
+                second_host,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: second_guest,
+                },
+            ),
+        ]);
+        let root_ports = BTreeMap::from([(7, root_port)]);
+        let iommu_endpoints = BTreeSet::from([first_guest.to_u32(), second_guest.to_u32()]);
+
+        assert_eq!(
+            removable_vfio_root_port_aliases(&slots, &root_ports, &iommu_endpoints).unwrap(),
+            vec![(root_port.to_u32(), first_guest.to_u32())]
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removable_vfio_group_without_viommu_needs_no_root_port_alias() {
+        let host = PciAddress::new(0, 0, 31, 3).unwrap();
+        let guest = PciAddress::new(0, 7, 0, 0).unwrap();
+        let slots = BTreeMap::from([(
+            host,
+            RemovableVfioSlot {
+                bus: 7,
+                guest_address: guest,
+            },
+        )]);
+
+        assert!(
+            removable_vfio_root_port_aliases(&slots, &BTreeMap::new(), &BTreeSet::new())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // Create a file-backed mapping parameters struct with the given `address` and `size` and other
