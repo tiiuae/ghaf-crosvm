@@ -13,6 +13,7 @@ use vm_control::PmeNotify;
 use crate::bus::HotPlugBus;
 use crate::bus::HotPlugKey;
 use crate::pci::pcie::pcie_host::PcieHostPort;
+use crate::pci::pcie::pcie_port::HotPlugOperation;
 use crate::pci::pcie::pcie_port::PciePort;
 use crate::pci::pcie::pcie_port::PciePortVariant;
 use crate::pci::pcie::*;
@@ -100,7 +101,8 @@ impl HotPlugBus for PcieRootPort {
 
         let hpc_sender = Event::new()?;
         let hpc_recvr = hpc_sender.try_clone()?;
-        self.pcie_port.set_hpc_sender(hpc_sender);
+        self.pcie_port
+            .set_hpc_sender(hpc_sender, HotPlugOperation::Plug);
         self.pcie_port
             .set_slot_status(PCIE_SLTSTA_PDS | PCIE_SLTSTA_ABP);
         self.pcie_port.trigger_hp_or_pme_interrupt();
@@ -134,7 +136,8 @@ impl HotPlugBus for PcieRootPort {
         let slot_control = self.pcie_port.get_slot_control();
         match slot_control & PCIE_SLTCTL_PIC {
             PCIE_SLTCTL_PIC_ON => {
-                self.pcie_port.set_hpc_sender(hpc_sender);
+                self.pcie_port
+                    .set_hpc_sender(hpc_sender, HotPlugOperation::Unplug);
                 self.pcie_port.set_slot_status(PCIE_SLTSTA_ABP);
                 self.pcie_port.trigger_hp_or_pme_interrupt();
             }
