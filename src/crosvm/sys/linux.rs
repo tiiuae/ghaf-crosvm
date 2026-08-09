@@ -1309,6 +1309,24 @@ struct RemovableVfioSlot {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn pci_bus_range(bus: u8) -> RangeInclusive<u32> {
+    RangeInclusive::new(
+        PciAddress {
+            bus,
+            dev: 0,
+            func: 0,
+        }
+        .to_u32(),
+        PciAddress {
+            bus,
+            dev: 31,
+            func: 7,
+        }
+        .to_u32(),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
 fn removable_vfio_group(path: &Path) -> Result<PathBuf> {
     canonicalize(path.join("iommu_group"))
         .with_context(|| format!("failed to resolve IOMMU group for {}", path.display()))
@@ -1374,20 +1392,9 @@ fn create_pure_virtual_pcie_root_port(
         add_control_tube(AnyControlTube::IrqTube(msi_host_tube));
         let pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
 
-        hp_stub.iommu_bus_ranges.push(RangeInclusive::new(
-            PciAddress {
-                bus: pci_bridge.get_secondary_num(),
-                dev: 0,
-                func: 0,
-            }
-            .to_u32(),
-            PciAddress {
-                bus: pci_bridge.get_subordinate_num(),
-                dev: 32,
-                func: 8,
-            }
-            .to_u32(),
-        ));
+        hp_stub
+            .iommu_bus_ranges
+            .push(pci_bus_range(pci_bridge.get_secondary_num()));
 
         devices.push((pci_bridge, None));
         hp_stub
@@ -5740,6 +5747,18 @@ mod tests {
             })
         );
         assert_eq!(removable_vfio_slot(unrelated_addr, &slots), None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn iommu_hotplug_range_covers_every_function_on_bus() {
+        let range = pci_bus_range(7);
+
+        assert!(range.contains(&PciAddress::new(0, 7, 0, 0).unwrap().to_u32()));
+        assert!(range.contains(&PciAddress::new(0, 7, 0, 7).unwrap().to_u32()));
+        assert!(range.contains(&PciAddress::new(0, 7, 31, 7).unwrap().to_u32()));
+        assert!(!range.contains(&PciAddress::new(0, 6, 31, 7).unwrap().to_u32()));
+        assert!(!range.contains(&PciAddress::new(0, 8, 0, 0).unwrap().to_u32()));
     }
 
     // Create a file-backed mapping parameters struct with the given `address` and `size` and other
