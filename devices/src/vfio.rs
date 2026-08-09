@@ -117,6 +117,8 @@ pub enum VfioError {
     VfioDeviceGetInfo(Error),
     #[error("failed to get vfio device's region info: {0}")]
     VfioDeviceGetRegionInfo(Error),
+    #[error("failed to reset vfio device: {0}")]
+    VfioDeviceReset(Error),
     #[error("container doesn't support IOMMU driver type {0:?}")]
     VfioIommuSupport(IommuType),
     #[error("failed to disable vfio device's irq: {0}")]
@@ -1034,6 +1036,7 @@ impl VfioDevice {
         let name = String::from(name_str);
         let dev = group.lock().get_device(&name)?;
         let (dev_info, dev_type) = Self::get_device_info(&dev)?;
+        Self::reset_if_supported(&dev, &dev_info)?;
         let regions = Self::get_regions(&dev, dev_info.num_regions)?;
         group.lock().add_device_num();
         let group_descriptor = group.lock().as_raw_descriptor();
@@ -1101,6 +1104,7 @@ impl VfioDevice {
                 return Err(e);
             }
         };
+        Self::reset_if_supported(&dev, &dev_info)?;
         let regions = match Self::get_regions(&dev, dev_info.num_regions) {
             Ok(regions) => regions,
             Err(e) => {
@@ -1247,14 +1251,23 @@ impl VfioDevice {
 
     /// call _DSM from the device's ACPI table
     pub fn acpi_dsm(&self, args: &[u8]) -> Result<Vec<u8>> {
-        let count = args.len();
+        // The ChromeOS VFIO ACPI ABI rejects buffers larger than one host page. Keep the ioctl
+        // header and its variable payload within that limit; the AML transport is page-backed and
+        // zero-padded, so truncating only removes unused tail bytes.
+        let count = args.len().min(
+            base::pagesize()
+                .saturating_sub(mem::size_of::<vfio_acpi_dsm>()),
+        );
         let mut dsm = vec_with_array_field::<vfio_acpi_dsm, u8>(count);
-        dsm[0].argsz = (mem::size_of::<vfio_acpi_dsm>() + mem::size_of_val(args)) as u32;
+        dsm[0].argsz = (mem::size_of::<vfio_acpi_dsm>() + count) as u32;
         dsm[0].padding = 0;
         // SAFETY:
         // Safe as we allocated enough space to hold args
         unsafe {
-            dsm[0].args.as_mut_slice(count).clone_from_slice(args);
+            dsm[0]
+                .args
+                .as_mut_slice(count)
+                .clone_from_slice(&args[..count]);
         }
         // SAFETY:
         // Safe as we are the owner of self and dsm which are valid value
@@ -1520,6 +1533,18 @@ impl VfioDevice {
         };
 
         Ok((dev_info, dev_type))
+    }
+
+    fn reset_if_supported(device_file: &File, dev_info: &vfio_device_info) -> Result<()> {
+        if dev_info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
+            return Ok(());
+        }
+
+        // SAFETY: VFIO_DEVICE_RESET takes no argument and device_file is a valid VFIO device fd.
+        if unsafe { ioctl(device_file, VFIO_DEVICE_RESET) } < 0 {
+            return Err(VfioError::VfioDeviceReset(get_error()));
+        }
+        Ok(())
     }
 
     /// Query interrupt information
