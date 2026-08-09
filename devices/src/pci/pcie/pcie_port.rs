@@ -579,12 +579,17 @@ impl PcieConfig {
                 if old_control != value {
                     let old_pic_state = old_control & PCIE_SLTCTL_PIC;
                     let pic_state = value & PCIE_SLTCTL_PIC;
-                    if old_pic_state == PCIE_SLTCTL_PIC_BLINK && old_pic_state != pic_state {
+                    let indicator_completed = (old_pic_state == PCIE_SLTCTL_PIC_BLINK
+                        && old_pic_state != pic_state)
+                        || (old_pic_state == PCIE_SLTCTL_PIC_ON
+                            && pic_state == PCIE_SLTCTL_PIC_OFF);
+                    if indicator_completed {
                         // The power indicator (PIC) is controled by the guest to indicate the power
                         // state of the slot.
                         // For successful hotplug: OFF => BLINK => (board enabled) => ON
                         // For failed hotplug: OFF => BLINK => (board enable failed) => OFF
                         // For hot unplug: ON => BLINK => (board disabled) => OFF
+                        // Linux can also disable a slot directly from ON => OFF.
                         // hot (un)plug is completed at next slot status write after it changed to
                         // ON or OFF state.
 
@@ -822,5 +827,47 @@ impl<T: PciePortVariant> PcieDevice for T {
 
     fn get_bridge_window_size(&self) -> (u64, u64) {
         self.get_pcie_port().get_bridge_window_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use base::EventWaitResult;
+
+    use super::*;
+
+    #[test]
+    fn direct_power_off_completes_hot_unplug() {
+        let root_cap = Arc::new(Mutex::new(PcieRootCap::new(1, 1)));
+        let mut config = PcieConfig::new(root_cap, true, PcieDevicePortType::RootPort);
+        let interrupt_flags = PCIE_SLTCTL_ABPE | PCIE_SLTCTL_CCIE | PCIE_SLTCTL_HPIE;
+        config.slot_control = Some(PCIE_SLTCTL_PIC_ON | interrupt_flags);
+        config.slot_status = PCIE_SLTSTA_PDS;
+
+        let completion_sender = Event::new().unwrap();
+        let completion_receiver = completion_sender.try_clone().unwrap();
+        config.hpc_sender = Some(HotPlugCompleteSender::new(completion_sender));
+
+        config.write_pcie_cap(
+            PCIE_SLTCTL_OFFSET,
+            &(PCIE_SLTCTL_PIC_OFF | interrupt_flags).to_le_bytes(),
+        );
+
+        assert!(config.removed_downstream_valid);
+        assert_eq!(config.slot_status & PCIE_SLTSTA_PDS, 0);
+        assert_eq!(
+            completion_receiver.wait_timeout(Duration::ZERO).unwrap(),
+            EventWaitResult::TimedOut
+        );
+
+        config.write_pcie_cap(PCIE_SLTSTA_OFFSET, &PCIE_SLTSTA_PDC.to_le_bytes());
+
+        assert_eq!(
+            completion_receiver.wait_timeout(Duration::ZERO).unwrap(),
+            EventWaitResult::Signaled
+        );
+        assert!(config.hpc_sender.is_none());
     }
 }

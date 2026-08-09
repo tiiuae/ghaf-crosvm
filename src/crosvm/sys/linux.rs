@@ -3251,13 +3251,19 @@ fn remove_hotplug_device(
             .lock()
             .get_hotplug_device(hotplug_key)
             .context("removable VFIO device is already detached")?;
+        let completion_event = hp_bus.lock().hot_unplug(pci_addr)?;
+        if let Some(event) = completion_event {
+            wait_for_hotplug_event(event, "PCI removal")?;
+        }
+        // Keep the endpoint registered with virtio-IOMMU until the guest has removed the PCI
+        // device.  Linux sends its final DETACH request while tearing the device down and warns if
+        // Crosvm removes the endpoint first.
         if let Some(iommu_host_tube) = iommu_host_tube {
             for group_pci_addr in &group_devices {
-                let request = VirtioIOMMURequest::VfioCommand(
-                    VirtioIOMMUVfioCommand::VfioDeviceDel {
+                let request =
+                    VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDeviceDel {
                         endpoint_addr: group_pci_addr.to_u32(),
-                    },
-                );
+                    });
                 match virtio_iommu_request(iommu_host_tube, &request)
                     .map_err(|_| VirtioIOMMUVfioError::SocketFailed)?
                 {
@@ -3265,10 +3271,6 @@ fn remove_hotplug_device(
                     resp => bail!("Unexpected message response: {:?}", resp),
                 }
             }
-        }
-        let completion_event = hp_bus.lock().hot_unplug(pci_addr)?;
-        if let Some(event) = completion_event {
-            wait_for_hotplug_event(event, "PCI removal")?;
         }
         for group_pci_addr in group_devices {
             sys_allocator.release_pci(group_pci_addr);
