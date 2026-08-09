@@ -191,7 +191,10 @@ impl HotPlugBus for PcieRootPort {
     fn add_hotplug_device_at_boot(&mut self, hotplug_key: HotPlugKey, guest_addr: PciAddress) {
         self.add_hotplug_device(hotplug_key, guest_addr);
         if self.downstream_devices.contains_key(&guest_addr) {
-            self.pcie_port.set_slot_status(PCIE_SLTSTA_PDS);
+            // A cold-plugged device starts present and powered on. Leaving the power indicator
+            // off makes hot_unplug treat the slot as already empty, so the guest never completes
+            // removal before a suspend/resume reattachment.
+            self.pcie_port.mark_slot_present_at_boot();
         }
     }
 
@@ -234,6 +237,10 @@ mod tests {
 
         assert_eq!(root_port.get_hotplug_device(key), Some(guest_addr));
         assert_ne!(root_port.pcie_port.slot_status() & PCIE_SLTSTA_PDS, 0);
+        assert_eq!(
+            root_port.pcie_port.get_slot_control() & PCIE_SLTCTL_PIC,
+            PCIE_SLTCTL_PIC_ON
+        );
         assert!(!root_port.pcie_port.is_hpc_pending());
     }
 }

@@ -387,6 +387,14 @@ impl PciePort {
         self.pcie_config.lock().set_slot_status(flag);
     }
 
+    pub fn mark_slot_present_at_boot(&mut self) {
+        let mut pcie_config = self.pcie_config.lock();
+        pcie_config.slot_status |= PCIE_SLTSTA_PDS;
+        if let Some(slot_control) = pcie_config.slot_control.as_mut() {
+            *slot_control = (*slot_control & !PCIE_SLTCTL_PIC) | PCIE_SLTCTL_PIC_ON;
+        }
+    }
+
     #[cfg(test)]
     pub fn slot_status(&self) -> u16 {
         self.pcie_config.lock().slot_status
