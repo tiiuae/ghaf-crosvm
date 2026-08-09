@@ -1663,14 +1663,14 @@ impl PciDevice for VfioPciDevice {
                     address.func += 1;
                 }
             }
+            let pci_address = self
+                .pci_address
+                .ok_or(PciDeviceError::PciAllocationFailed)?;
             if let Some(msi_cap) = &mut self.msi_cap {
-                msi_cap.config.set_pci_address(self.pci_address.unwrap());
+                msi_cap.config.set_pci_address(pci_address);
             }
             if let Some(msix_cap) = &mut self.msix_cap {
-                msix_cap
-                    .lock()
-                    .config
-                    .set_pci_address(self.pci_address.unwrap());
+                msix_cap.lock().config.set_pci_address(pci_address);
             }
         }
         self.pci_address.ok_or(PciDeviceError::PciAllocationFailed)
