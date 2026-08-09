@@ -2979,7 +2979,7 @@ fn add_hotplug_device(
     removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
     #[cfg(feature = "swap")] swap_controller: &mut Option<SwapController>,
     vfio_container_manager: &mut VfioContainerManager,
-) -> Result<()> {
+) -> Result<Option<Event>> {
     let host_addr = PciAddress::from_path(&device.path)
         .context("failed to parse hotplug device's PCI address")?;
     let hp_bus = get_hp_bus(linux, host_addr, removable_vfio_slots)?;
@@ -3133,10 +3133,21 @@ fn add_hotplug_device(
             None
         }
     };
-    if let Some(event) = completion_event {
-        wait_for_hotplug_event(event, "PCI insertion")?;
+    Ok(completion_event)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn send_hotplug_completion_response(event: Event, tube: SendTube) {
+    let response = match wait_for_hotplug_event(event, "PCI insertion") {
+        Ok(()) => VmResponse::Ok,
+        Err(e) => {
+            error!("PCI hotplug completion failure: {}", e);
+            VmResponse::Err(base::Error::new(libc::EINVAL))
+        }
+    };
+    if let Err(e) = tube.send(&response) {
+        error!("failed to send deferred PCI hotplug response: {}", e);
     }
-    Ok(())
 }
 
 #[cfg(feature = "pci-hotplug")]
@@ -3542,14 +3553,14 @@ fn handle_hotplug_command(
     #[cfg(feature = "swap")] swap_controller: &mut Option<SwapController>,
     vfio_container_manager: &mut VfioContainerManager,
     removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
-) -> VmResponse {
+) -> Result<Option<Event>> {
     let iommu_host_tube = if cfg.vfio_isolate_hotplug {
         iommu_host_tube
     } else {
         None
     };
 
-    let ret = if add {
+    if add {
         add_hotplug_device(
             linux,
             sys_allocator,
@@ -3570,15 +3581,8 @@ fn handle_hotplug_command(
             iommu_host_tube,
             device,
             removable_vfio_slots,
-        )
-    };
-
-    match ret {
-        Ok(()) => VmResponse::Ok,
-        Err(e) => {
-            error!("handle_hotplug_command failure: {}", e);
-            VmResponse::Err(base::Error::new(libc::EINVAL))
-        }
+        )?;
+        Ok(None)
     }
 }
 
@@ -3646,6 +3650,8 @@ fn process_vm_request(
     )]
     add_tubes: &mut Vec<TaggedControlTube>,
 ) -> Result<VmRequestResult> {
+    #[cfg(target_arch = "x86_64")]
+    let mut deferred_hotplug_response = None;
     #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
     let mut add_irq_control_tubes = Vec::new();
     #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
@@ -3678,7 +3684,7 @@ fn process_vm_request(
         VmRequest::HotPlugVfioCommand { device, add } => {
             #[cfg(target_arch = "x86_64")]
             {
-                let response = handle_hotplug_command(
+                let result = handle_hotplug_command(
                     state.linux,
                     state.sys_allocator,
                     state.cfg,
@@ -3692,29 +3698,39 @@ fn process_vm_request(
                     state.vfio_container_manager,
                     state.removable_vfio_slots,
                 );
-                if matches!(response, VmResponse::Ok) {
-                    if add {
-                        state.connected_vfio_devices.insert(device.path.clone());
-                    } else {
-                        let removed_slot = PciAddress::from_path(&device.path)
-                            .ok()
-                            .and_then(|host_addr| state.removable_vfio_slots.get(&host_addr))
-                            .copied();
-                        if let Some(removed_slot) = removed_slot {
-                            state.connected_vfio_devices.retain(|path| {
-                                PciAddress::from_path(path)
-                                    .ok()
-                                    .and_then(|host_addr| {
-                                        state.removable_vfio_slots.get(&host_addr)
-                                    })
-                                    .is_none_or(|slot| slot.bus != removed_slot.bus)
-                            });
+                match result {
+                    Ok(completion_event) => {
+                        if add {
+                            state.connected_vfio_devices.insert(device.path.clone());
+                            if let Some(event) = completion_event {
+                                deferred_hotplug_response =
+                                    Some((event, tube.try_clone_send_tube()?));
+                            }
                         } else {
-                            state.connected_vfio_devices.remove(&device.path);
+                            let removed_slot = PciAddress::from_path(&device.path)
+                                .ok()
+                                .and_then(|host_addr| state.removable_vfio_slots.get(&host_addr))
+                                .copied();
+                            if let Some(removed_slot) = removed_slot {
+                                state.connected_vfio_devices.retain(|path| {
+                                    PciAddress::from_path(path)
+                                        .ok()
+                                        .and_then(|host_addr| {
+                                            state.removable_vfio_slots.get(&host_addr)
+                                        })
+                                        .is_none_or(|slot| slot.bus != removed_slot.bus)
+                                });
+                            } else {
+                                state.connected_vfio_devices.remove(&device.path);
+                            }
                         }
+                        VmResponse::Ok
+                    }
+                    Err(e) => {
+                        error!("handle_hotplug_command failure: {}", e);
+                        VmResponse::Err(base::Error::new(libc::EINVAL))
                     }
                 }
-                response
             }
 
             #[cfg(not(target_arch = "x86_64"))]
@@ -3991,6 +4007,15 @@ fn process_vm_request(
                     ))?;
             }
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    if let Some((event, send_tube)) = deferred_hotplug_response {
+        std::thread::Builder::new()
+            .name("pci_hotplug_wait".to_owned())
+            .spawn(move || send_hotplug_completion_response(event, send_tube))
+            .context("failed to spawn PCI hotplug completion thread")?;
+        return Ok(VmRequestResult::new(None, false));
     }
 
     Ok(VmRequestResult::new(Some(response), false))
@@ -5845,6 +5870,34 @@ mod tests {
         assert!(removable_vfio_group_is_complete(first, &slots, |addr| {
             attached.contains(&addr)
         }));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn hotplug_completion_response_is_deferred_until_guest_signal() {
+        let (control_tube, response_tube) = Tube::pair().unwrap();
+        let completion_event = Event::new().unwrap();
+        let signal_event = completion_event.try_clone().unwrap();
+        let send_tube = control_tube.try_clone_send_tube().unwrap();
+
+        let waiter = std::thread::spawn(move || {
+            send_hotplug_completion_response(completion_event, send_tube)
+        });
+
+        response_tube
+            .set_recv_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        assert!(response_tube.recv::<VmResponse>().is_err());
+        signal_event.signal().unwrap();
+
+        response_tube
+            .set_recv_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(matches!(
+            response_tube.recv::<VmResponse>(),
+            Ok(VmResponse::Ok)
+        ));
+        waiter.join().unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
