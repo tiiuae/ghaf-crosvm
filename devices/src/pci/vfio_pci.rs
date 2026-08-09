@@ -719,13 +719,15 @@ impl VfioPciDevice {
     ) -> Result<Self, PciDeviceError> {
         let preferred_address = if let Some(bus_num) = hotplug_bus_number {
             debug!("hotplug bus {}", bus_num);
-            PciAddress {
-                // Caller specify pcie bus number for hotplug device
+            let mut address = guest_address.unwrap_or(PciAddress {
                 bus: bus_num,
-                // devfn should be 0, otherwise pcie root port couldn't detect it
                 dev: 0,
                 func: 0,
-            }
+            });
+            // The caller selects the root port. Preserve an explicitly assigned function so
+            // members of one host IOMMU group can remain a single multifunction guest device.
+            address.bus = bus_num;
+            address
         } else if let Some(guest_address) = guest_address {
             debug!("guest PCI address {}", guest_address);
             guest_address
