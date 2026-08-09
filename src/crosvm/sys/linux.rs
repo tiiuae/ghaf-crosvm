@@ -2857,6 +2857,14 @@ fn get_hp_bus(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn removable_vfio_hotplug_bus(
+    host_addr: PciAddress,
+    removable_vfio_buses: &BTreeMap<PciAddress, u8>,
+) -> Option<u8> {
+    removable_vfio_buses.get(&host_addr).copied()
+}
+
+#[cfg(target_arch = "x86_64")]
 fn wait_for_hotplug_event(event: Event, operation: &str) -> Result<()> {
     match event.wait_timeout(Duration::from_secs(15))? {
         EventWaitResult::Signaled => Ok(()),
@@ -2937,6 +2945,11 @@ fn add_hotplug_device(
         }
         HotPlugDeviceType::EndPoint => {
             let hotplug_key = HotPlugKey::HostVfio { host_addr };
+            // Removable devices that were present at boot have a dedicated root port.  Reuse
+            // that root port when the device is attached again; otherwise VfioPciDevice falls
+            // back to the host BDF (usually bus 0), which is outside the virtio-IOMMU hotplug
+            // ranges and also leaves a failed PCI reservation behind for subsequent retries.
+            let hotplug_bus_number = removable_vfio_hotplug_bus(host_addr, removable_vfio_buses);
             let (vfio_device, jail, viommu_mapper) = create_vfio_device(
                 cfg.jail_config.as_ref(),
                 &*linux.vm,
@@ -2944,7 +2957,7 @@ fn add_hotplug_device(
                 add_control_tube,
                 &device.path,
                 true,
-                None,
+                hotplug_bus_number,
                 None,
                 None,
                 if iommu_host_tube.is_some() {
@@ -5604,12 +5617,24 @@ pub fn setup_emulator_crash_reporting(_cfg: &Config) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use arch::CpuSet;
     use vm_memory::MemoryRegionPurpose;
 
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removable_vfio_reattach_reuses_dedicated_bus() {
+        let host_addr = PciAddress::new(0, 0, 20, 3).unwrap();
+        let unrelated_addr = PciAddress::new(0, 0, 31, 3).unwrap();
+        let buses = BTreeMap::from([(host_addr, 7)]);
+
+        assert_eq!(removable_vfio_hotplug_bus(host_addr, &buses), Some(7));
+        assert_eq!(removable_vfio_hotplug_bus(unrelated_addr, &buses), None);
+    }
 
     // Create a file-backed mapping parameters struct with the given `address` and `size` and other
     // parameters set to default values.
