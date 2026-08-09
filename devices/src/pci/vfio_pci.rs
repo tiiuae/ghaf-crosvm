@@ -99,6 +99,10 @@ const PCI_CAP_ID_MSI: u8 = 0x05;
 const PCI_CAP_ID_MSIX: u8 = 0x11;
 const PCI_CAP_ID_PM: u8 = 0x01;
 
+fn vfio_region_is_backed(size: u64) -> bool {
+    size != 0
+}
+
 // Size of the standard PCI config space
 const PCI_CONFIG_SPACE_SIZE: u32 = 0x100;
 // Size of the standard PCIe config space: 4KB
@@ -1355,6 +1359,17 @@ impl VfioPciDevice {
         let mut mem_bars: Vec<PciBarConfiguration> = Vec::new();
 
         while i <= VFIO_PCI_ROM_REGION_INDEX {
+            let region_size = self.device.get_region_size(i as usize);
+            if !vfio_region_is_backed(region_size) {
+                debug!(
+                    "{}: skipping VFIO PCI region {} because it has no backing storage",
+                    self.debug_label(),
+                    i
+                );
+                i += 1;
+                continue;
+            }
+
             let mut low: u32 = 0xffffffff;
             let offset: u32 = if i == VFIO_PCI_ROM_REGION_INDEX {
                 0x30
@@ -2137,7 +2152,14 @@ impl Suspendable for VfioPciDevice {
 mod tests {
     use resources::AddressRange;
 
+    use super::vfio_region_is_backed;
     use super::VfioResourceAllocator;
+
+    #[test]
+    fn zero_size_vfio_region_is_not_backed() {
+        assert!(!vfio_region_is_backed(0));
+        assert!(vfio_region_is_backed(1));
+    }
 
     #[test]
     fn no_overlap() {
