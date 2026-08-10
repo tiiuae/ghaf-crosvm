@@ -45,6 +45,7 @@ pub use crate::vfio::VFIO_DEVICE_FEATURE_PROBE;
 pub use crate::vfio::VFIO_DEVICE_FEATURE_SET;
 pub use crate::vfio::VFIO_DEVICE_FLAGS_PCI;
 pub use crate::vfio::VFIO_DEVICE_FLAGS_PLATFORM;
+pub use crate::vfio::VFIO_DEVICE_FLAGS_RESET;
 pub use crate::vfio::VFIO_DMA_MAP_FLAG_READ;
 pub use crate::vfio::VFIO_DMA_MAP_FLAG_WRITE;
 pub use crate::vfio::VFIO_GROUP_FLAGS_VIABLE;

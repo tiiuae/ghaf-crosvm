@@ -25,6 +25,7 @@
   - [Pmem](./devices/pmem/README.md)
     - [VirtIO Pmem](./devices/pmem/basic.md)
     - [Sharing host directory with virtio-pmem (experimental)](./devices/pmem/pmem_ext2.md)
+  - [Trusted Platform Module](./devices/tpm.md)
   - [USB](./devices/usb.md)
   - [Wayland](./devices/wayland.md)
   - [Video (experimental)](./devices/video.md)

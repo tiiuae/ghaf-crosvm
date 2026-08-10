@@ -124,6 +124,16 @@ impl UsbPort {
         self.backend_device().is_some()
     }
 
+    fn clear_connection_state(&self) {
+        self.portsc.clear_bits(
+            PORTSC_PORT_SPEED_MASK
+                | PORTSC_CURRENT_CONNECT_STATUS
+                | PORTSC_PORT_ENABLED
+                | PORTSC_CONNECT_STATUS_CHANGE
+                | PORTSC_PORT_ENABLED_DISABLED_CHANGE,
+        );
+    }
+
     fn reset(&self) -> std::result::Result<(), InterrupterError> {
         if self.is_attached() {
             self.send_device_connected_event()?;
@@ -151,7 +161,15 @@ impl UsbPort {
             Some(DeviceSpeed::SuperPlus) => 5,
         };
         self.portsc.set_bits(speed_id << PORTSC_PORT_SPEED_SHIFT);
-        self.send_device_connected_event()
+        if let Err(reason) = self.send_device_connected_event() {
+            // The guest may not have initialized its event ring yet. Leave
+            // the port completely empty so a later hotplug retry can reuse
+            // it instead of leaking one occupied port per failed attempt.
+            *locked = None;
+            self.clear_connection_state();
+            return Err(reason);
+        }
+        Ok(())
     }
 
     /// Inform the guest kernel there is device connected to this port. It combines first few steps
@@ -261,5 +279,75 @@ impl UsbHub {
             Some(port) => port.detach(),
             None => Err(Error::NoSuchPort(port_id)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base::Event;
+    use vm_memory::GuestMemory;
+
+    use super::*;
+    use crate::usb::xhci::XhciRegs;
+
+    #[test]
+    fn failed_connection_can_restore_empty_port_state() {
+        let test_reg32 = register!(
+            name: "test",
+            ty: u32,
+            offset: 0x0,
+            reset_value: 0,
+            guest_writeable_mask: 0x0,
+            guest_write_1_to_clear_mask: 0,
+        );
+        let test_reg64 = register!(
+            name: "test",
+            ty: u64,
+            offset: 0x0,
+            reset_value: 0,
+            guest_writeable_mask: 0x0,
+            guest_write_1_to_clear_mask: 0,
+        );
+        let regs = XhciRegs {
+            usbcmd: test_reg32.clone(),
+            usbsts: test_reg32.clone(),
+            dnctrl: test_reg32.clone(),
+            crcr: test_reg64.clone(),
+            dcbaap: test_reg64.clone(),
+            config: test_reg64.clone(),
+            portsc: vec![test_reg32.clone(); MAX_PORTS as usize],
+            doorbells: Vec::new(),
+            iman: test_reg32.clone(),
+            imod: test_reg32.clone(),
+            erstsz: test_reg32.clone(),
+            erstba: test_reg64.clone(),
+            erdp: test_reg64,
+        };
+        let portsc = regs.portsc[0].clone();
+        let port = UsbPort::new(
+            BackendType::Usb2,
+            1,
+            portsc.clone(),
+            regs.usbsts.clone(),
+            Arc::new(Mutex::new(Interrupter::new(
+                GuestMemory::new(&[]).unwrap(),
+                Event::new().unwrap(),
+                &regs,
+            ))),
+        );
+
+        portsc.set_bits(3 << PORTSC_PORT_SPEED_SHIFT);
+        assert!(port.send_device_connected_event().is_err());
+        port.clear_connection_state();
+
+        assert_eq!(
+            portsc.get_value()
+                & (PORTSC_PORT_SPEED_MASK
+                    | PORTSC_CURRENT_CONNECT_STATUS
+                    | PORTSC_PORT_ENABLED
+                    | PORTSC_CONNECT_STATUS_CHANGE
+                    | PORTSC_PORT_ENABLED_DISABLED_CHANGE),
+            0
+        );
     }
 }

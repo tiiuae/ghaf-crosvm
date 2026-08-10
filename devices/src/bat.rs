@@ -20,6 +20,7 @@ use base::RawDescriptor;
 use base::Tube;
 use base::WaitContext;
 use base::WorkerThread;
+use power_monitor::BatteryHealth;
 use power_monitor::BatteryStatus;
 use power_monitor::CreatePowerClientFn;
 use power_monitor::CreatePowerMonitorFn;
@@ -196,6 +197,40 @@ const BATTERY_STATUS_VAL_NOT_CHARGING: u32 = 3;
 
 /// Goldfish Battery health
 const BATTERY_HEALTH_VAL_UNKNOWN: u32 = 0;
+const BATTERY_HEALTH_VAL_GOOD: u32 = 1;
+const BATTERY_HEALTH_VAL_OVERHEAT: u32 = 2;
+const BATTERY_HEALTH_VAL_DEAD: u32 = 3;
+const BATTERY_HEALTH_VAL_OVER_VOLTAGE: u32 = 4;
+const BATTERY_HEALTH_VAL_UNSPECIFIED_FAILURE: u32 = 5;
+const BATTERY_HEALTH_VAL_COLD: u32 = 6;
+const BATTERY_HEALTH_VAL_WATCHDOG_TIMER_EXPIRE: u32 = 7;
+const BATTERY_HEALTH_VAL_SAFETY_TIMER_EXPIRE: u32 = 8;
+const BATTERY_HEALTH_VAL_OVER_CURRENT: u32 = 9;
+const BATTERY_HEALTH_VAL_CALIBRATION_REQUIRED: u32 = 10;
+const BATTERY_HEALTH_VAL_WARM: u32 = 11;
+const BATTERY_HEALTH_VAL_COOL: u32 = 12;
+const BATTERY_HEALTH_VAL_HOT: u32 = 13;
+const BATTERY_HEALTH_VAL_NO_BATTERY: u32 = 14;
+
+fn battery_health_value(health: BatteryHealth) -> u32 {
+    match health {
+        BatteryHealth::Unknown => BATTERY_HEALTH_VAL_UNKNOWN,
+        BatteryHealth::Good => BATTERY_HEALTH_VAL_GOOD,
+        BatteryHealth::Overheat => BATTERY_HEALTH_VAL_OVERHEAT,
+        BatteryHealth::Dead => BATTERY_HEALTH_VAL_DEAD,
+        BatteryHealth::OverVoltage => BATTERY_HEALTH_VAL_OVER_VOLTAGE,
+        BatteryHealth::UnspecifiedFailure => BATTERY_HEALTH_VAL_UNSPECIFIED_FAILURE,
+        BatteryHealth::Cold => BATTERY_HEALTH_VAL_COLD,
+        BatteryHealth::WatchdogTimerExpire => BATTERY_HEALTH_VAL_WATCHDOG_TIMER_EXPIRE,
+        BatteryHealth::SafetyTimerExpire => BATTERY_HEALTH_VAL_SAFETY_TIMER_EXPIRE,
+        BatteryHealth::OverCurrent => BATTERY_HEALTH_VAL_OVER_CURRENT,
+        BatteryHealth::CalibrationRequired => BATTERY_HEALTH_VAL_CALIBRATION_REQUIRED,
+        BatteryHealth::Warm => BATTERY_HEALTH_VAL_WARM,
+        BatteryHealth::Cool => BATTERY_HEALTH_VAL_COOL,
+        BatteryHealth::Hot => BATTERY_HEALTH_VAL_HOT,
+        BatteryHealth::NoBattery => BATTERY_HEALTH_VAL_NO_BATTERY,
+    }
+}
 
 // Goldfish ac online status
 const AC_ONLINE_VAL_OFFLINE: u32 = 0;
@@ -321,7 +356,10 @@ fn command_monitor(
 
                     match data.battery {
                         Some(battery_data) => {
+                            inject_irq |= bat_state.set_present(1);
                             inject_irq |= bat_state.set_capacity(battery_data.percent);
+                            inject_irq |=
+                                bat_state.set_health(battery_health_value(battery_data.health));
                             let battery_status = match battery_data.status {
                                 BatteryStatus::Unknown => BATTERY_STATUS_VAL_UNKNOWN,
                                 BatteryStatus::Charging => BATTERY_STATUS_VAL_CHARGING,
@@ -494,7 +532,9 @@ impl GoldfishBattery {
 
                 match data.battery {
                     Some(battery_data) => {
+                        bat_state.set_present(1);
                         bat_state.set_capacity(battery_data.percent);
+                        bat_state.set_health(battery_health_value(battery_data.health));
                         let battery_status = match battery_data.status {
                             BatteryStatus::Unknown => BATTERY_STATUS_VAL_UNKNOWN,
                             BatteryStatus::Charging => BATTERY_STATUS_VAL_CHARGING,
@@ -750,6 +790,7 @@ mod tests {
                 battery: Some(power_monitor::BatteryData {
                     percent: 50,
                     status: power_monitor::BatteryStatus::Unknown,
+                    health: power_monitor::BatteryHealth::Unknown,
                     voltage: 0,
                     current: 0,
                     charge_counter: 0,

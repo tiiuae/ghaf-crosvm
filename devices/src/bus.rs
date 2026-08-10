@@ -274,6 +274,13 @@ pub trait HotPlugBus: Send {
     /// * 'hotplug_key' - the key to identify hotplug device from host view
     /// * 'guest_addr' - the guest pci address for hotplug device
     fn add_hotplug_device(&mut self, hotplug_key: HotPlugKey, guest_addr: PciAddress);
+    /// Add a device that is already present when the VM boots without emitting a hotplug event.
+    ///
+    /// Implementations that expose slot presence separately from the downstream device map should
+    /// override this method and mark the slot populated.
+    fn add_hotplug_device_at_boot(&mut self, hotplug_key: HotPlugKey, guest_addr: PciAddress) {
+        self.add_hotplug_device(hotplug_key, guest_addr);
+    }
     /// get guest pci address from the specified hotplug_key
     fn get_hotplug_device(&self, hotplug_key: HotPlugKey) -> Option<PciAddress>;
     /// Check whether this hotplug bus is empty

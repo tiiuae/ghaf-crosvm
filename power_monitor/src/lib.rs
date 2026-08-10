@@ -20,15 +20,16 @@ pub trait PowerClient: Send {
     fn last_request_timestamp(&self) -> Option<SystemTime>;
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PowerData {
     pub ac_online: bool,
     pub battery: Option<BatteryData>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BatteryData {
     pub status: BatteryStatus,
+    pub health: BatteryHealth,
     pub percent: u32,
     /// Battery voltage in microvolts.
     pub voltage: u32,
@@ -40,12 +41,31 @@ pub struct BatteryData {
     pub charge_full: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatteryStatus {
     Unknown,
     Charging,
     Discharging,
     NotCharging,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatteryHealth {
+    Unknown,
+    Good,
+    Overheat,
+    Dead,
+    OverVoltage,
+    UnspecifiedFailure,
+    Cold,
+    WatchdogTimerExpire,
+    SafetyTimerExpire,
+    OverCurrent,
+    CalibrationRequired,
+    Warm,
+    Cool,
+    Hot,
+    NoBattery,
 }
 
 pub trait CreatePowerMonitorFn:
@@ -70,6 +90,9 @@ impl<T> CreatePowerClientFn for T where
 
 #[cfg(feature = "powerd")]
 pub mod powerd;
+
+#[cfg(feature = "sysfs")]
+pub mod sysfs;
 
 #[cfg(feature = "powerd")]
 mod protos {

@@ -29,6 +29,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::ffi::CString;
+#[cfg(target_arch = "x86_64")]
+use std::fs::canonicalize;
 #[cfg(target_arch = "aarch64")]
 use std::fs::create_dir_all;
 use std::fs::File;
@@ -42,7 +44,6 @@ use std::mem;
 use std::ops::RangeInclusive;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-#[cfg(target_arch = "aarch64")]
 use std::path::PathBuf;
 #[cfg(target_arch = "aarch64")]
 use std::process;
@@ -52,6 +53,8 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::thread::JoinHandle;
+#[cfg(target_arch = "x86_64")]
+use std::time::Duration;
 
 #[cfg(target_arch = "aarch64")]
 use aarch64::AArch64 as Arch;
@@ -1004,6 +1007,7 @@ fn create_devices(
     vfio_container_manager: &mut VfioContainerManager,
     // Stores a set of PID of child processes that are suppose to exit cleanly.
     worker_process_pids: &mut BTreeSet<Pid>,
+    #[cfg(target_arch = "x86_64")] removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     #[cfg(feature = "balloon")]
@@ -1014,14 +1018,37 @@ fn create_devices(
         let mut coiommu_attached_endpoints = Vec::new();
 
         for vfio_dev in &cfg.vfio {
+            #[cfg(target_arch = "x86_64")]
+            let removable_slot = if vfio_dev.removable {
+                let host_addr = PciAddress::from_path(&vfio_dev.path)
+                    .context("removable VFIO devices must be PCI devices")?;
+                Some(
+                    *removable_vfio_slots
+                        .get(&host_addr)
+                        .context("missing root port for removable VFIO device")?,
+                )
+            } else {
+                None
+            };
             let (dev, jail, viommu_mapper) = create_vfio_device(
                 cfg.jail_config.as_ref(),
                 vm,
                 resources,
                 add_control_tube,
                 &vfio_dev.path,
+                // This device is present while the initial PCI topology is built, so allocate its
+                // BARs like any other cold-plugged device.  `removable` still selects a dedicated
+                // hotplug-capable root port and is used for subsequent detach/reattach operations.
                 false,
+                #[cfg(target_arch = "x86_64")]
+                removable_slot.map(|slot| slot.bus),
+                #[cfg(not(target_arch = "x86_64"))]
                 None,
+                #[cfg(target_arch = "x86_64")]
+                removable_slot
+                    .map(|slot| slot.guest_address)
+                    .or(vfio_dev.guest_address),
+                #[cfg(not(target_arch = "x86_64"))]
                 vfio_dev.guest_address,
                 Some(&mut coiommu_attached_endpoints),
                 vfio_dev.iommu,
@@ -1053,6 +1080,9 @@ fn create_devices(
                     devices.push((Box::new(vfio_pci_device), jail));
                 }
                 VfioDeviceVariant::Platform(vfio_plat_dev) => {
+                    if vfio_dev.removable {
+                        return Err(anyhow!("removable vfio-platform devices are not supported"));
+                    }
                     devices.push((Box::new(vfio_plat_dev), jail));
                 }
             }
@@ -1272,6 +1302,62 @@ struct HotPlugStub {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemovableVfioSlot {
+    bus: u8,
+    guest_address: PciAddress,
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pci_bus_range(bus: u8) -> RangeInclusive<u32> {
+    RangeInclusive::new(
+        PciAddress {
+            bus,
+            dev: 0,
+            func: 0,
+        }
+        .to_u32(),
+        PciAddress {
+            bus,
+            dev: 31,
+            func: 7,
+        }
+        .to_u32(),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+fn removable_vfio_group(path: &Path) -> Result<PathBuf> {
+    canonicalize(path.join("iommu_group"))
+        .with_context(|| format!("failed to resolve IOMMU group for {}", path.display()))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn removable_vfio_root_port_aliases(
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
+    root_port_addresses: &BTreeMap<u8, PciAddress>,
+    iommu_endpoints: &BTreeSet<u32>,
+) -> Result<Vec<(u32, u32)>> {
+    let mut mapper_endpoint_by_bus = BTreeMap::new();
+    for slot in removable_vfio_slots.values() {
+        let endpoint = slot.guest_address.to_u32();
+        if iommu_endpoints.contains(&endpoint) {
+            mapper_endpoint_by_bus.entry(slot.bus).or_insert(endpoint);
+        }
+    }
+
+    mapper_endpoint_by_bus
+        .into_iter()
+        .map(|(bus, mapper_endpoint)| {
+            let root_port = root_port_addresses
+                .get(&bus)
+                .with_context(|| format!("missing address for removable VFIO root port {bus}"))?;
+            Ok((root_port.to_u32(), mapper_endpoint))
+        })
+        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
 impl HotPlugStub {
     /// Constructs empty HotPlugStub.
     fn new() -> Self {
@@ -1331,20 +1417,9 @@ fn create_pure_virtual_pcie_root_port(
         add_control_tube(AnyControlTube::IrqTube(msi_host_tube));
         let pci_bridge = Box::new(PciBridge::new(pcie_root_port.clone(), msi_device_tube));
 
-        hp_stub.iommu_bus_ranges.push(RangeInclusive::new(
-            PciAddress {
-                bus: pci_bridge.get_secondary_num(),
-                dev: 0,
-                func: 0,
-            }
-            .to_u32(),
-            PciAddress {
-                bus: pci_bridge.get_subordinate_num(),
-                dev: 32,
-                func: 8,
-            }
-            .to_u32(),
-        ));
+        hp_stub
+            .iommu_bus_ranges
+            .push(pci_bus_range(pci_bridge.get_secondary_num()));
 
         devices.push((pci_bridge, None));
         hp_stub
@@ -2293,12 +2368,16 @@ fn run_vm(
 
     let battery = if cfg.battery_config.is_some() {
         #[cfg_attr(
-            not(feature = "power-monitor-powerd"),
+            not(any(feature = "power-monitor-powerd", feature = "power-monitor-sysfs")),
             allow(clippy::manual_map, clippy::needless_match, unused_mut)
         )]
         let jail = if let Some(jail_config) = cfg.jail_config.as_ref() {
             let mut config = SandboxConfig::new(jail_config, "battery");
             #[cfg(feature = "power-monitor-powerd")]
+            {
+                config.bind_mounts = true;
+            }
+            #[cfg(feature = "power-monitor-sysfs")]
             {
                 config.bind_mounts = true;
             }
@@ -2310,6 +2389,11 @@ fn run_vm(
             {
                 let system_bus_socket_path = Path::new("/run/dbus/system_bus_socket");
                 jail.mount_bind(system_bus_socket_path, system_bus_socket_path, true)?;
+            }
+            #[cfg(feature = "power-monitor-sysfs")]
+            {
+                let power_supply_path = Path::new("/sys/class/power_supply");
+                jail.mount_bind(power_supply_path, power_supply_path, false)?;
             }
             Some(jail)
         } else {
@@ -2367,7 +2451,82 @@ fn run_vm(
 
     let mut worker_process_pids = BTreeSet::new();
 
-    let mut devices = create_devices(
+    #[cfg(feature = "pci-hotplug")]
+    // TODO(293801301): Remove unused_variables after aarch64 support
+    #[allow(unused_variables)]
+    let pci_hotplug_slots = cfg.pci_hotplug_slots;
+    #[cfg(not(feature = "pci-hotplug"))]
+    #[allow(unused_variables)]
+    let pci_hotplug_slots: Option<u8> = None;
+
+    #[cfg(target_arch = "x86_64")]
+    let removable_vfio_groups = cfg
+        .vfio
+        .iter()
+        .filter(|vfio| vfio.removable)
+        .map(|vfio| {
+            Ok((
+                PciAddress::from_path(&vfio.path)
+                    .context("removable VFIO devices must use PCI sysfs paths")?,
+                removable_vfio_group(&vfio.path)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    #[cfg(target_arch = "x86_64")]
+    let removable_vfio_group_paths: BTreeSet<PathBuf> = removable_vfio_groups
+        .iter()
+        .map(|(_, group)| group.clone())
+        .collect();
+    #[cfg(target_arch = "x86_64")]
+    let removable_vfio_group_count = u8::try_from(removable_vfio_group_paths.len())
+        .context("too many removable VFIO IOMMU groups")?;
+    #[cfg(target_arch = "x86_64")]
+    let root_port_count = pci_hotplug_slots
+        .unwrap_or(1)
+        .checked_add(removable_vfio_group_count)
+        .context("too many PCI hotplug slots")?;
+    #[cfg(target_arch = "x86_64")]
+    let mut devices = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    let hp_stub = create_pure_virtual_pcie_root_port(
+        &mut sys_allocator,
+        &mut add_control_tube,
+        &mut devices,
+        root_port_count,
+    )?;
+    #[cfg(target_arch = "x86_64")]
+    let removable_vfio_group_buses: BTreeMap<PathBuf, u8> = removable_vfio_group_paths
+        .into_iter()
+        .zip(hp_stub.hotplug_buses.keys().copied())
+        .collect();
+    #[cfg(target_arch = "x86_64")]
+    let removable_vfio_slots: BTreeMap<PciAddress, RemovableVfioSlot> = {
+        let mut next_functions = BTreeMap::<PathBuf, u8>::new();
+        removable_vfio_groups
+            .into_iter()
+            .map(|(host_addr, group)| {
+                let function = next_functions.entry(group.clone()).or_default();
+                if *function >= 8 {
+                    bail!(
+                        "removable VFIO IOMMU group {} has more than eight PCI functions",
+                        group.display()
+                    );
+                }
+                let bus = *removable_vfio_group_buses
+                    .get(&group)
+                    .context("missing root port for removable VFIO IOMMU group")?;
+                let slot = RemovableVfioSlot {
+                    bus,
+                    guest_address: PciAddress::new(0, u32::from(bus), 0, u32::from(*function))
+                        .context("invalid removable VFIO guest address")?,
+                };
+                *function += 1;
+                Ok((host_addr, slot))
+            })
+            .collect::<Result<_>>()?
+    };
+
+    let created_devices = create_devices(
         &cfg,
         &*vm,
         &mut sys_allocator,
@@ -2383,24 +2542,48 @@ fn run_vm(
         &reg_evt_wrtube,
         &mut vfio_container_manager,
         &mut worker_process_pids,
+        #[cfg(target_arch = "x86_64")]
+        &removable_vfio_slots,
     )?;
-
-    #[cfg(feature = "pci-hotplug")]
-    // TODO(293801301): Remove unused_variables after aarch64 support
-    #[allow(unused_variables)]
-    let pci_hotplug_slots = cfg.pci_hotplug_slots;
-    #[cfg(not(feature = "pci-hotplug"))]
-    #[allow(unused_variables)]
-    let pci_hotplug_slots: Option<u8> = None;
     #[cfg(target_arch = "x86_64")]
-    let hp_stub = create_pure_virtual_pcie_root_port(
-        &mut sys_allocator,
-        &mut add_control_tube,
-        &mut devices,
-        pci_hotplug_slots.unwrap_or(1),
-    )?;
+    devices.extend(created_devices);
+    #[cfg(not(target_arch = "x86_64"))]
+    let mut devices = created_devices;
 
     arch::assign_pci_addresses(&mut devices, &mut sys_allocator)?;
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let root_port_addresses = hp_stub
+            .hotplug_buses
+            .iter()
+            .map(|(bus, hotplug_bus)| {
+                let address = hotplug_bus.lock().get_address().with_context(|| {
+                    format!("removable VFIO root port {bus} has no PCI address")
+                })?;
+                Ok((*bus, address))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let iommu_endpoints = iommu_attached_endpoints.keys().copied().collect();
+        let aliases = removable_vfio_root_port_aliases(
+            &removable_vfio_slots,
+            &root_port_addresses,
+            &iommu_endpoints,
+        )?;
+
+        // Linux groups downstream functions with a non-ACS root port only when the root port is
+        // also managed by the IOMMU. Reuse the host VFIO group's mapper for that root port so all
+        // functions attach to one guest domain instead of competing domains for the same mapper.
+        for (root_port, mapper_endpoint) in aliases {
+            let mapper = iommu_attached_endpoints
+                .get(&mapper_endpoint)
+                .context("missing removable VFIO mapper endpoint")?
+                .clone();
+            if iommu_attached_endpoints.insert(root_port, mapper).is_some() {
+                bail!("removable VFIO root port {root_port:#x} is already an IOMMU endpoint");
+            }
+        }
+    }
 
     let pci_devices: Vec<&dyn PciDevice> = devices
         .iter()
@@ -2593,7 +2776,13 @@ fn run_vm(
     }
     #[cfg(target_arch = "x86_64")]
     let hp_thread = {
+        let dedicated_vfio_buses: BTreeSet<u8> =
+            removable_vfio_slots.values().map(|slot| slot.bus).collect();
         for (bus_num, hp_bus) in hp_stub.hotplug_buses.into_iter() {
+            if dedicated_vfio_buses.contains(&bus_num) {
+                linux.hotplug_bus.insert(bus_num, hp_bus);
+                continue;
+            }
             #[cfg(feature = "pci-hotplug")]
             if let Some(hotplug_manager) = &mut hotplug_manager {
                 hotplug_manager.add_port(hp_bus)?;
@@ -2602,6 +2791,19 @@ fn run_vm(
             }
             #[cfg(not(feature = "pci-hotplug"))]
             linux.hotplug_bus.insert(bus_num, hp_bus);
+        }
+
+        for (host_addr, slot) in &removable_vfio_slots {
+            let hp_bus = linux
+                .hotplug_bus
+                .get(&slot.bus)
+                .context("missing root port for cold-plugged removable VFIO device")?;
+            hp_bus.lock().add_hotplug_device_at_boot(
+                HotPlugKey::HostVfio {
+                    host_addr: *host_addr,
+                },
+                slot.guest_address,
+            );
         }
 
         if let Some(pm) = &linux.pm {
@@ -2655,6 +2857,8 @@ fn run_vm(
         hp_control_tube,
         #[cfg(target_arch = "x86_64")]
         hp_thread,
+        #[cfg(target_arch = "x86_64")]
+        removable_vfio_slots,
         #[cfg(feature = "pci-hotplug")]
         hotplug_manager,
         #[cfg(feature = "swap")]
@@ -2744,6 +2948,11 @@ fn start_pci_root_worker(
                 PciRootCommand::Remove(addr) => {
                     pci_root.lock().remove_device(addr);
                 }
+                PciRootCommand::Barrier(event) => {
+                    if let Err(e) = event.signal() {
+                        error!("failed to signal PCI root barrier: {}", e);
+                    }
+                }
                 PciRootCommand::Kill => break,
             },
             Err(e) => {
@@ -2758,7 +2967,15 @@ fn start_pci_root_worker(
 fn get_hp_bus(
     linux: &RunnableLinuxVm,
     host_addr: PciAddress,
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
 ) -> Result<Arc<Mutex<dyn HotPlugBus>>> {
+    if let Some(slot) = removable_vfio_slots.get(&host_addr) {
+        return linux
+            .hotplug_bus
+            .get(&slot.bus)
+            .cloned()
+            .context("dedicated VFIO hotplug root port is unavailable");
+    }
     for (_, hp_bus) in linux.hotplug_bus.iter() {
         if hp_bus.lock().is_match(host_addr).is_some() {
             return Ok(hp_bus.clone());
@@ -2768,23 +2985,70 @@ fn get_hp_bus(
 }
 
 #[cfg(target_arch = "x86_64")]
+fn removable_vfio_slot(
+    host_addr: PciAddress,
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
+) -> Option<RemovableVfioSlot> {
+    removable_vfio_slots.get(&host_addr).copied()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn removable_vfio_group_is_complete(
+    host_addr: PciAddress,
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
+    mut is_attached: impl FnMut(PciAddress) -> bool,
+) -> bool {
+    let Some(slot) = removable_vfio_slots.get(&host_addr) else {
+        return true;
+    };
+
+    removable_vfio_slots
+        .iter()
+        .filter(|(_, group_slot)| group_slot.bus == slot.bus)
+        .all(|(group_host_addr, _)| is_attached(*group_host_addr))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn wait_for_hotplug_event(event: Event, operation: &str) -> Result<()> {
+    match event.wait_timeout(Duration::from_secs(30))? {
+        EventWaitResult::Signaled => Ok(()),
+        EventWaitResult::TimedOut => bail!("timed out waiting for guest to complete {operation}"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn wait_for_pci_root_updates(hp_control_tube: &mpsc::Sender<PciRootCommand>) -> Result<()> {
+    let event = Event::new().context("failed to create PCI root barrier")?;
+    hp_control_tube
+        .send(PciRootCommand::Barrier(event.try_clone()?))
+        .context("failed to send PCI root barrier")?;
+    wait_for_hotplug_event(event, "PCI root update")
+}
+
+#[cfg(target_arch = "x86_64")]
 fn add_hotplug_device(
     linux: &mut RunnableLinuxVm,
-    sys_allocator: &mut SystemAllocator,
+    sys_allocator: &Arc<Mutex<SystemAllocator>>,
     cfg: &Config,
     add_control_tube: &mut impl FnMut(AnyControlTube),
     hp_control_tube: &mpsc::Sender<PciRootCommand>,
     iommu_host_tube: Option<&Tube>,
     device: &HotPlugDeviceInfo,
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
     #[cfg(feature = "swap")] swap_controller: &mut Option<SwapController>,
     vfio_container_manager: &mut VfioContainerManager,
-) -> Result<()> {
+) -> Result<Option<Event>> {
     let host_addr = PciAddress::from_path(&device.path)
         .context("failed to parse hotplug device's PCI address")?;
-    let hp_bus = get_hp_bus(linux, host_addr)?;
+    let hp_bus = get_hp_bus(linux, host_addr, removable_vfio_slots)?;
+    wait_for_hotplug_event(
+        hp_bus.lock().get_ready_notification()?,
+        "PCI hotplug readiness",
+    )?;
 
     let (hotplug_key, pci_address) = match device.device_type {
         HotPlugDeviceType::UpstreamPort | HotPlugDeviceType::DownstreamPort => {
+            let mut sys_allocator = sys_allocator.lock();
             let (vm_host_tube, vm_device_tube) = Tube::pair().context("failed to create tube")?;
             add_control_tube(AnyControlTube::Vm(vm_host_tube));
             let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -2825,7 +3089,7 @@ fn add_hotplug_device(
                 linux,
                 pci_bridge,
                 None,
-                sys_allocator,
+                &mut sys_allocator,
                 hp_control_tube,
                 #[cfg(feature = "swap")]
                 swap_controller,
@@ -2835,37 +3099,48 @@ fn add_hotplug_device(
         }
         HotPlugDeviceType::EndPoint => {
             let hotplug_key = HotPlugKey::HostVfio { host_addr };
-            let (vfio_device, jail, viommu_mapper) = create_vfio_device(
-                cfg.jail_config.as_ref(),
-                &*linux.vm,
-                sys_allocator,
-                add_control_tube,
-                &device.path,
-                true,
-                None,
-                None,
-                None,
-                if iommu_host_tube.is_some() {
-                    IommuDevType::VirtioIommu
-                } else {
-                    IommuDevType::NoIommu
-                },
-                None,
-                vfio_container_manager,
-            )?;
-            let vfio_pci_device = match vfio_device {
-                VfioDeviceVariant::Pci(pci) => Box::new(pci),
-                VfioDeviceVariant::Platform(_) => bail!("vfio platform hotplug not supported"),
+            // Removable devices that were present at boot have a dedicated root port.  Reuse
+            // that root port when the device is attached again; otherwise VfioPciDevice falls
+            // back to the host BDF (usually bus 0), which is outside the virtio-IOMMU hotplug
+            // ranges and also leaves a failed PCI reservation behind for subsequent retries.
+            let removable_slot = removable_vfio_slot(host_addr, removable_vfio_slots);
+            let (pci_address, viommu_mapper) = {
+                let mut sys_allocator = sys_allocator.lock();
+                let (vfio_device, jail, viommu_mapper) = create_vfio_device(
+                    cfg.jail_config.as_ref(),
+                    &*linux.vm,
+                    &mut sys_allocator,
+                    add_control_tube,
+                    &device.path,
+                    true,
+                    removable_slot.map(|slot| slot.bus),
+                    removable_slot.map(|slot| slot.guest_address),
+                    None,
+                    if iommu_host_tube.is_some() {
+                        IommuDevType::VirtioIommu
+                    } else {
+                        IommuDevType::NoIommu
+                    },
+                    None,
+                    vfio_container_manager,
+                )?;
+                let vfio_pci_device = match vfio_device {
+                    VfioDeviceVariant::Pci(pci) => Box::new(pci),
+                    VfioDeviceVariant::Platform(_) => {
+                        bail!("vfio platform hotplug not supported")
+                    }
+                };
+                let pci_address = Arch::register_pci_device(
+                    linux,
+                    vfio_pci_device,
+                    jail,
+                    &mut sys_allocator,
+                    hp_control_tube,
+                    #[cfg(feature = "swap")]
+                    swap_controller,
+                )?;
+                (pci_address, viommu_mapper)
             };
-            let pci_address = Arch::register_pci_device(
-                linux,
-                vfio_pci_device,
-                jail,
-                sys_allocator,
-                hp_control_tube,
-                #[cfg(feature = "swap")]
-                swap_controller,
-            )?;
             if let Some(iommu_host_tube) = iommu_host_tube {
                 let endpoint_addr = pci_address.to_u32();
                 let vfio_wrapper = viommu_mapper.context("expected mapper")?;
@@ -2891,11 +3166,46 @@ fn add_hotplug_device(
             (hotplug_key, pci_address)
         }
     };
-    hp_bus.lock().add_hotplug_device(hotplug_key, pci_address);
-    if device.hp_interrupt {
-        hp_bus.lock().hot_plug(pci_address)?;
+    // Device registration is processed asynchronously by the PCI root worker.  Wait until it has
+    // also completed any VM-memory request for the ECAM mapping before notifying the guest.  The
+    // allocator must remain unlocked here because the VM-memory handler needs it to service that
+    // request.
+    wait_for_pci_root_updates(hp_control_tube)?;
+    let completion_event = {
+        let mut hp_bus = hp_bus.lock();
+        hp_bus.add_hotplug_device(hotplug_key, pci_address);
+        // A removable IOMMU group shares one physical slot in the guest.  Register every
+        // function before notifying the guest so Linux discovers the complete multifunction
+        // device in one scan instead of interpreting each function as another button press.
+        let group_complete =
+            removable_vfio_group_is_complete(host_addr, removable_vfio_slots, |group_host_addr| {
+                hp_bus
+                    .get_hotplug_device(HotPlugKey::HostVfio {
+                        host_addr: group_host_addr,
+                    })
+                    .is_some()
+            });
+        if device.hp_interrupt && group_complete {
+            hp_bus.hot_plug(pci_address)?
+        } else {
+            None
+        }
+    };
+    Ok(completion_event)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn send_hotplug_completion_response(event: Event, tube: SendTube) {
+    let response = match wait_for_hotplug_event(event, "PCI insertion") {
+        Ok(()) => VmResponse::Ok,
+        Err(e) => {
+            error!("PCI hotplug completion failure: {}", e);
+            VmResponse::Err(base::Error::new(libc::EINVAL))
+        }
+    };
+    if let Err(e) = tube.send(&response) {
+        error!("failed to send deferred PCI hotplug response: {}", e);
     }
-    Ok(())
 }
 
 #[cfg(feature = "pci-hotplug")]
@@ -3036,9 +3346,10 @@ fn remove_hotplug_bridge(
 #[cfg(target_arch = "x86_64")]
 fn remove_hotplug_device(
     linux: &mut RunnableLinuxVm,
-    sys_allocator: &mut SystemAllocator,
+    sys_allocator: &Arc<Mutex<SystemAllocator>>,
     iommu_host_tube: Option<&Tube>,
     device: &HotPlugDeviceInfo,
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
 ) -> Result<()> {
     let host_addr = PciAddress::from_path(&device.path)?;
     let hotplug_key = match device.device_type {
@@ -3046,6 +3357,58 @@ fn remove_hotplug_device(
         HotPlugDeviceType::DownstreamPort => HotPlugKey::HostDownstreamPort { host_addr },
         HotPlugDeviceType::EndPoint => HotPlugKey::HostVfio { host_addr },
     };
+
+    if let Some(slot) = removable_vfio_slots.get(&host_addr) {
+        let hp_bus = linux
+            .hotplug_bus
+            .get(&slot.bus)
+            .cloned()
+            .context("dedicated VFIO hotplug root port is unavailable")?;
+        let group_devices = {
+            let hp_bus = hp_bus.lock();
+            removable_vfio_slots
+                .iter()
+                .filter(|(_, member_slot)| member_slot.bus == slot.bus)
+                .filter_map(|(member_host_addr, _)| {
+                    hp_bus.get_hotplug_device(HotPlugKey::HostVfio {
+                        host_addr: *member_host_addr,
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let pci_addr = hp_bus
+            .lock()
+            .get_hotplug_device(hotplug_key)
+            .context("removable VFIO device is already detached")?;
+        let completion_event = hp_bus.lock().hot_unplug(pci_addr)?;
+        if let Some(event) = completion_event {
+            wait_for_hotplug_event(event, "PCI removal")?;
+        }
+        // Keep the endpoint registered with virtio-IOMMU until the guest has removed the PCI
+        // device.  Linux sends its final DETACH request while tearing the device down and warns if
+        // Crosvm removes the endpoint first.
+        if let Some(iommu_host_tube) = iommu_host_tube {
+            for group_pci_addr in &group_devices {
+                let request =
+                    VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDeviceDel {
+                        endpoint_addr: group_pci_addr.to_u32(),
+                    });
+                match virtio_iommu_request(iommu_host_tube, &request)
+                    .map_err(|_| VirtioIOMMUVfioError::SocketFailed)?
+                {
+                    VirtioIOMMUResponse::VfioResponse(VirtioIOMMUVfioResult::Ok) => (),
+                    resp => bail!("Unexpected message response: {:?}", resp),
+                }
+            }
+        }
+        let mut sys_allocator = sys_allocator.lock();
+        for group_pci_addr in group_devices {
+            sys_allocator.release_pci(group_pci_addr);
+        }
+        return Ok(());
+    }
+
+    let mut sys_allocator = sys_allocator.lock();
 
     let hp_bus = linux
         .hotplug_bus
@@ -3105,7 +3468,7 @@ fn remove_hotplug_device(
                     removed_key = Some(hotplug_key);
                     remove_hotplug_bridge(
                         linux,
-                        sys_allocator,
+                        &mut sys_allocator,
                         &mut buses_to_remove,
                         hotplug_key,
                         bus_num,
@@ -3128,7 +3491,7 @@ fn remove_hotplug_device(
                         if addr_alias.bus == host_addr.bus && hp_bus_lock.is_empty() {
                             remove_hotplug_bridge(
                                 linux,
-                                sys_allocator,
+                                &mut sys_allocator,
                                 &mut buses_to_remove,
                                 hotplug_key.unwrap(),
                                 *simbling_bus_num,
@@ -3238,7 +3601,7 @@ fn send_pvclock_cmd(tube: &Tube, command: PvClockCommand) -> Result<Option<PvClo
 #[cfg(target_arch = "x86_64")]
 fn handle_hotplug_command(
     linux: &mut RunnableLinuxVm,
-    sys_allocator: &mut SystemAllocator,
+    sys_allocator: &Arc<Mutex<SystemAllocator>>,
     cfg: &Config,
     add_control_tube: &mut impl FnMut(AnyControlTube),
     hp_control_tube: &mpsc::Sender<PciRootCommand>,
@@ -3247,14 +3610,15 @@ fn handle_hotplug_command(
     add: bool,
     #[cfg(feature = "swap")] swap_controller: &mut Option<SwapController>,
     vfio_container_manager: &mut VfioContainerManager,
-) -> VmResponse {
+    removable_vfio_slots: &BTreeMap<PciAddress, RemovableVfioSlot>,
+) -> Result<Option<Event>> {
     let iommu_host_tube = if cfg.vfio_isolate_hotplug {
         iommu_host_tube
     } else {
         None
     };
 
-    let ret = if add {
+    if add {
         add_hotplug_device(
             linux,
             sys_allocator,
@@ -3263,20 +3627,20 @@ fn handle_hotplug_command(
             hp_control_tube,
             iommu_host_tube,
             device,
+            removable_vfio_slots,
             #[cfg(feature = "swap")]
             swap_controller,
             vfio_container_manager,
         )
     } else {
-        remove_hotplug_device(linux, sys_allocator, iommu_host_tube, device)
-    };
-
-    match ret {
-        Ok(()) => VmResponse::Ok,
-        Err(e) => {
-            error!("handle_hotplug_command failure: {}", e);
-            VmResponse::Err(base::Error::new(libc::EINVAL))
-        }
+        remove_hotplug_device(
+            linux,
+            sys_allocator,
+            iommu_host_tube,
+            device,
+            removable_vfio_slots,
+        )?;
+        Ok(None)
     }
 }
 
@@ -3296,6 +3660,10 @@ struct ControlLoopState<'a> {
     iommu_host_tube: &'a Option<Arc<Mutex<Tube>>>,
     #[cfg(target_arch = "x86_64")]
     hp_control_tube: &'a mpsc::Sender<PciRootCommand>,
+    #[cfg(target_arch = "x86_64")]
+    removable_vfio_slots: &'a BTreeMap<PciAddress, RemovableVfioSlot>,
+    #[cfg(target_arch = "x86_64")]
+    connected_vfio_devices: &'a mut BTreeSet<PathBuf>,
     guest_suspended_cvar: &'a Option<Arc<(Mutex<bool>, Condvar)>>,
     #[cfg(feature = "pci-hotplug")]
     hotplug_manager: &'a mut Option<PciHotPlugManager>,
@@ -3340,6 +3708,8 @@ fn process_vm_request(
     )]
     add_tubes: &mut Vec<TaggedControlTube>,
 ) -> Result<VmRequestResult> {
+    #[cfg(target_arch = "x86_64")]
+    let mut deferred_hotplug_response = None;
     #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
     let mut add_irq_control_tubes = Vec::new();
     #[cfg(any(target_arch = "x86_64", feature = "pci-hotplug"))]
@@ -3372,9 +3742,9 @@ fn process_vm_request(
         VmRequest::HotPlugVfioCommand { device, add } => {
             #[cfg(target_arch = "x86_64")]
             {
-                handle_hotplug_command(
+                let result = handle_hotplug_command(
                     state.linux,
-                    &mut state.sys_allocator.lock(),
+                    state.sys_allocator,
                     state.cfg,
                     &mut add_control_tube,
                     state.hp_control_tube,
@@ -3384,7 +3754,41 @@ fn process_vm_request(
                     #[cfg(feature = "swap")]
                     state.swap_controller,
                     state.vfio_container_manager,
-                )
+                    state.removable_vfio_slots,
+                );
+                match result {
+                    Ok(completion_event) => {
+                        if add {
+                            state.connected_vfio_devices.insert(device.path.clone());
+                            if let Some(event) = completion_event {
+                                deferred_hotplug_response =
+                                    Some((event, tube.try_clone_send_tube()?));
+                            }
+                        } else {
+                            let removed_slot = PciAddress::from_path(&device.path)
+                                .ok()
+                                .and_then(|host_addr| state.removable_vfio_slots.get(&host_addr))
+                                .copied();
+                            if let Some(removed_slot) = removed_slot {
+                                state.connected_vfio_devices.retain(|path| {
+                                    PciAddress::from_path(path)
+                                        .ok()
+                                        .and_then(|host_addr| {
+                                            state.removable_vfio_slots.get(&host_addr)
+                                        })
+                                        .is_none_or(|slot| slot.bus != removed_slot.bus)
+                                });
+                            } else {
+                                state.connected_vfio_devices.remove(&device.path);
+                            }
+                        }
+                        VmResponse::Ok
+                    }
+                    Err(e) => {
+                        error!("handle_hotplug_command failure: {}", e);
+                        VmResponse::Err(base::Error::new(libc::EINVAL))
+                    }
+                }
             }
 
             #[cfg(not(target_arch = "x86_64"))]
@@ -3393,6 +3797,16 @@ fn process_vm_request(
                 let _ = (device, add);
                 let _ = &state.vfio_container_manager;
                 VmResponse::Ok
+            }
+        }
+        VmRequest::ListVfioDevices => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                VmResponse::VfioDevicePaths(state.connected_vfio_devices.iter().cloned().collect())
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                VmResponse::VfioDevicePaths(Vec::new())
             }
         }
         #[cfg(feature = "pci-hotplug")]
@@ -3653,6 +4067,15 @@ fn process_vm_request(
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if let Some((event, send_tube)) = deferred_hotplug_response {
+        std::thread::Builder::new()
+            .name("pci_hotplug_wait".to_owned())
+            .spawn(move || send_hotplug_completion_response(event, send_tube))
+            .context("failed to spawn PCI hotplug completion thread")?;
+        return Ok(VmRequestResult::new(None, false));
+    }
+
     Ok(VmRequestResult::new(Some(response), false))
 }
 
@@ -3814,6 +4237,7 @@ fn run_control(
     iommu_host_tube: Option<Tube>,
     #[cfg(target_arch = "x86_64")] hp_control_tube: mpsc::Sender<PciRootCommand>,
     #[cfg(target_arch = "x86_64")] hp_thread: std::thread::JoinHandle<()>,
+    #[cfg(target_arch = "x86_64")] removable_vfio_slots: BTreeMap<PciAddress, RemovableVfioSlot>,
     #[cfg(feature = "pci-hotplug")] mut hotplug_manager: Option<PciHotPlugManager>,
     #[allow(unused_mut)] // mut is required x86 only
     #[cfg(feature = "swap")]
@@ -4305,6 +4729,9 @@ fn run_control(
     #[cfg(feature = "registered_events")]
     let mut registered_evt_tubes: HashMap<RegisteredEvent, HashSet<AddressedProtoTube>> =
         HashMap::new();
+    #[cfg(target_arch = "x86_64")]
+    let mut connected_vfio_devices: BTreeSet<PathBuf> =
+        cfg.vfio.iter().map(|vfio| vfio.path.clone()).collect();
 
     'wait: loop {
         let events = {
@@ -4520,6 +4947,10 @@ fn run_control(
                             iommu_host_tube: &iommu_host_tube,
                             #[cfg(target_arch = "x86_64")]
                             hp_control_tube: &hp_control_tube,
+                            #[cfg(target_arch = "x86_64")]
+                            removable_vfio_slots: &removable_vfio_slots,
+                            #[cfg(target_arch = "x86_64")]
+                            connected_vfio_devices: &mut connected_vfio_devices,
                             guest_suspended_cvar: &guest_suspended_cvar,
                             #[cfg(feature = "pci-hotplug")]
                             hotplug_manager: &mut hotplug_manager,
@@ -5425,12 +5856,172 @@ pub fn setup_emulator_crash_reporting(_cfg: &Config) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     use arch::CpuSet;
     use vm_memory::MemoryRegionPurpose;
 
     use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removable_vfio_reattach_reuses_dedicated_bus() {
+        let host_addr = PciAddress::new(0, 0, 20, 3).unwrap();
+        let unrelated_addr = PciAddress::new(0, 0, 31, 3).unwrap();
+        let guest_address = PciAddress::new(0, 7, 0, 2).unwrap();
+        let slots = BTreeMap::from([(
+            host_addr,
+            RemovableVfioSlot {
+                bus: 7,
+                guest_address,
+            },
+        )]);
+
+        assert_eq!(
+            removable_vfio_slot(host_addr, &slots),
+            Some(RemovableVfioSlot {
+                bus: 7,
+                guest_address,
+            })
+        );
+        assert_eq!(removable_vfio_slot(unrelated_addr, &slots), None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removable_vfio_group_waits_for_every_member() {
+        let first = PciAddress::new(0, 0, 31, 0).unwrap();
+        let second = PciAddress::new(0, 0, 31, 3).unwrap();
+        let third = PciAddress::new(0, 0, 31, 4).unwrap();
+        let slots = BTreeMap::from([
+            (
+                first,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: PciAddress::new(0, 7, 0, 0).unwrap(),
+                },
+            ),
+            (
+                second,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: PciAddress::new(0, 7, 0, 1).unwrap(),
+                },
+            ),
+            (
+                third,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: PciAddress::new(0, 7, 0, 2).unwrap(),
+                },
+            ),
+        ]);
+
+        let attached = BTreeSet::from([first, second]);
+        assert!(!removable_vfio_group_is_complete(first, &slots, |addr| {
+            attached.contains(&addr)
+        }));
+
+        let attached = BTreeSet::from([first, second, third]);
+        assert!(removable_vfio_group_is_complete(first, &slots, |addr| {
+            attached.contains(&addr)
+        }));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn hotplug_completion_response_is_deferred_until_guest_signal() {
+        let (control_tube, response_tube) = Tube::pair().unwrap();
+        let completion_event = Event::new().unwrap();
+        let signal_event = completion_event.try_clone().unwrap();
+        let send_tube = control_tube.try_clone_send_tube().unwrap();
+
+        let waiter = std::thread::spawn(move || {
+            send_hotplug_completion_response(completion_event, send_tube)
+        });
+
+        response_tube
+            .set_recv_timeout(Some(Duration::from_millis(10)))
+            .unwrap();
+        assert!(response_tube.recv::<VmResponse>().is_err());
+        signal_event.signal().unwrap();
+
+        response_tube
+            .set_recv_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(matches!(
+            response_tube.recv::<VmResponse>(),
+            Ok(VmResponse::Ok)
+        ));
+        waiter.join().unwrap();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn iommu_hotplug_range_covers_every_function_on_bus() {
+        let range = pci_bus_range(7);
+
+        assert!(range.contains(&PciAddress::new(0, 7, 0, 0).unwrap().to_u32()));
+        assert!(range.contains(&PciAddress::new(0, 7, 0, 7).unwrap().to_u32()));
+        assert!(range.contains(&PciAddress::new(0, 7, 31, 7).unwrap().to_u32()));
+        assert!(!range.contains(&PciAddress::new(0, 6, 31, 7).unwrap().to_u32()));
+        assert!(!range.contains(&PciAddress::new(0, 8, 0, 0).unwrap().to_u32()));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removable_vfio_group_aliases_one_mapper_to_its_root_port() {
+        let first_host = PciAddress::new(0, 0, 31, 0).unwrap();
+        let second_host = PciAddress::new(0, 0, 31, 3).unwrap();
+        let first_guest = PciAddress::new(0, 7, 0, 0).unwrap();
+        let second_guest = PciAddress::new(0, 7, 0, 1).unwrap();
+        let root_port = PciAddress::new(0, 0, 1, 0).unwrap();
+        let slots = BTreeMap::from([
+            (
+                first_host,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: first_guest,
+                },
+            ),
+            (
+                second_host,
+                RemovableVfioSlot {
+                    bus: 7,
+                    guest_address: second_guest,
+                },
+            ),
+        ]);
+        let root_ports = BTreeMap::from([(7, root_port)]);
+        let iommu_endpoints = BTreeSet::from([first_guest.to_u32(), second_guest.to_u32()]);
+
+        assert_eq!(
+            removable_vfio_root_port_aliases(&slots, &root_ports, &iommu_endpoints).unwrap(),
+            vec![(root_port.to_u32(), first_guest.to_u32())]
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removable_vfio_group_without_viommu_needs_no_root_port_alias() {
+        let host = PciAddress::new(0, 0, 31, 3).unwrap();
+        let guest = PciAddress::new(0, 7, 0, 0).unwrap();
+        let slots = BTreeMap::from([(
+            host,
+            RemovableVfioSlot {
+                bus: 7,
+                guest_address: guest,
+            },
+        )]);
+
+        assert!(
+            removable_vfio_root_port_aliases(&slots, &BTreeMap::new(), &BTreeSet::new())
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     // Create a file-backed mapping parameters struct with the given `address` and `size` and other
     // parameters set to default values.

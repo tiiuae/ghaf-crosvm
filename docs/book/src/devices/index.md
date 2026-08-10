@@ -28,7 +28,7 @@ Here is a (non-comprehensive) list of emulated devices provided by crosvm.
 - [`rng`] - Entropy source used to seed guest OS's entropy pool.
 - [`scsi`] - SCSI device.
 - [`snd`] - Encodes and decodes audio streams.
-- [`tpm`] - Creates a TPM (Trusted Platform Module) device backed by vTPM daemon.
+- [`tpm`] - Creates a TPM (Trusted Platform Module) device backed by a vTPM daemon or swtpm.
 - [`video`] - Allows the guest to leverage the host's video capabilities.
 - [`wayland`] - Allows the guest to use the host's Wayland socket.
 - [`vsock`] - Enables use of virtual sockets for the guest.
@@ -82,7 +82,7 @@ Currently, only network devices are supported.
 [`scsi`]: scsi.md
 [`serial`]: https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/src/serial.rs
 [`snd`]: https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/src/virtio/snd/
-[`tpm`]: https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/src/virtio/tpm.rs
+[`tpm`]: tpm.md
 [`vhost-user`]: vhost_user.md
 [`video`]: video.md
 [`vsock`]: https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/src/virtio/vhost/vsock.rs

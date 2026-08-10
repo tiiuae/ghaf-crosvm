@@ -7,6 +7,7 @@ license = "BSD-3-Clause"
 
 [features]
 powerd = ["dbus", "system_api", "protobuf"]
+sysfs = []
 
 [dependencies]
 base = { workspace = true }
@@ -18,3 +19,6 @@ thiserror = { workspace = true }
 
 [build-dependencies]
 proto_build_tools = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

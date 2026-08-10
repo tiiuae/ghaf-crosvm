@@ -117,6 +117,8 @@ pub enum VfioError {
     VfioDeviceGetInfo(Error),
     #[error("failed to get vfio device's region info: {0}")]
     VfioDeviceGetRegionInfo(Error),
+    #[error("failed to reset vfio device: {0}")]
+    VfioDeviceReset(Error),
     #[error("container doesn't support IOMMU driver type {0:?}")]
     VfioIommuSupport(IommuType),
     #[error("failed to disable vfio device's irq: {0}")]
@@ -348,11 +350,18 @@ impl VfioContainer {
             .open("/dev/vfio/vfio")
             .map_err(VfioError::OpenContainer)?;
 
-        Self::new_from_container(container)
+        Self::new_with_iommu_type(container, None)
     }
 
-    // Construct a VfioContainer from an exist container file.
+    // Construct a VfioContainer from an existing, already configured container file.
     pub fn new_from_container(container: File) -> Result<Self> {
+        // Hotplug passes a duplicate of a Type1 container that has already had VFIO_SET_IOMMU
+        // applied.  The duplicate shares that kernel state, so remember it locally instead of
+        // treating the imported descriptor as an unconfigured new container.
+        Self::new_with_iommu_type(container, Some(IommuType::Type1V2))
+    }
+
+    fn new_with_iommu_type(container: File, iommu_type: Option<IommuType>) -> Result<Self> {
         // SAFETY:
         // Safe as file is vfio container descriptor and ioctl is defined by kernel.
         let version = unsafe { ioctl(&container, VFIO_GET_API_VERSION) };
@@ -363,7 +372,7 @@ impl VfioContainer {
         Ok(VfioContainer {
             container,
             groups: HashMap::new(),
-            iommu_type: None,
+            iommu_type,
         })
     }
 
@@ -405,10 +414,7 @@ impl VfioContainer {
         user_addr: u64,
         write_en: bool,
     ) -> Result<()> {
-        match self
-            .iommu_type
-            .expect("vfio_dma_map called before configuring IOMMU")
-        {
+        match self.iommu_type.ok_or(VfioError::InvalidOperation)? {
             IommuType::Type1V2 | IommuType::Type1ChromeOS => {
                 self.vfio_iommu_type1_dma_map(iova, size, user_addr, write_en)
             }
@@ -447,10 +453,7 @@ impl VfioContainer {
     }
 
     pub fn vfio_dma_unmap(&self, iova: u64, size: u64) -> Result<()> {
-        match self
-            .iommu_type
-            .expect("vfio_dma_unmap called before configuring IOMMU")
-        {
+        match self.iommu_type.ok_or(VfioError::InvalidOperation)? {
             IommuType::Type1V2 | IommuType::Type1ChromeOS => {
                 self.vfio_iommu_type1_dma_unmap(iova, size)
             }
@@ -479,10 +482,7 @@ impl VfioContainer {
     }
 
     pub fn vfio_get_iommu_page_size_mask(&self) -> Result<u64> {
-        match self
-            .iommu_type
-            .expect("vfio_get_iommu_page_size_mask called before configuring IOMMU")
-        {
+        match self.iommu_type.ok_or(VfioError::InvalidOperation)? {
             IommuType::Type1V2 | IommuType::Type1ChromeOS => {
                 self.vfio_iommu_type1_get_iommu_page_size_mask()
             }
@@ -510,10 +510,7 @@ impl VfioContainer {
     }
 
     pub fn vfio_iommu_iova_get_iova_ranges(&self) -> Result<Vec<AddressRange>> {
-        match self
-            .iommu_type
-            .expect("vfio_iommu_iova_get_iova_ranges called before configuring IOMMU")
-        {
+        match self.iommu_type.ok_or(VfioError::InvalidOperation)? {
             IommuType::Type1V2 | IommuType::Type1ChromeOS => {
                 self.vfio_iommu_type1_get_iova_ranges()
             }
@@ -988,9 +985,13 @@ pub struct VfioRegion {
     mmaps: Vec<vfio_region_sparse_mmap_area>,
     // type and subtype for cap type
     cap_info: Option<(u32, u32)>,
-    // if true, then the caller can safely mmap the MSIX region
-    // if false, the caller should remove the MSIX part of the region before mmapping
-    msix_region_mmappable: bool,
+    // Preserve driver-provided sparse mappings exactly. This is required by some mediated
+    // devices, such as NVIDIA vGPUs, even when a sparse area overlaps MSI-X data.
+    preserve_sparse_mmaps: bool,
+}
+
+fn region_cap_preserves_sparse_mmaps(cap_id: u32) -> bool {
+    cap_id == VFIO_REGION_INFO_CAP_SPARSE_MMAP
 }
 
 /// Vfio device for exposing regions which could be read/write to kernel vfio device.
@@ -1034,6 +1035,7 @@ impl VfioDevice {
         let name = String::from(name_str);
         let dev = group.lock().get_device(&name)?;
         let (dev_info, dev_type) = Self::get_device_info(&dev)?;
+        Self::reset_if_supported(&dev, &dev_info)?;
         let regions = Self::get_regions(&dev, dev_info.num_regions)?;
         group.lock().add_device_num();
         let group_descriptor = group.lock().as_raw_descriptor();
@@ -1101,6 +1103,7 @@ impl VfioDevice {
                 return Err(e);
             }
         };
+        Self::reset_if_supported(&dev, &dev_info)?;
         let regions = match Self::get_regions(&dev, dev_info.num_regions) {
             Ok(regions) => regions,
             Err(e) => {
@@ -1247,14 +1250,23 @@ impl VfioDevice {
 
     /// call _DSM from the device's ACPI table
     pub fn acpi_dsm(&self, args: &[u8]) -> Result<Vec<u8>> {
-        let count = args.len();
+        // The ChromeOS VFIO ACPI ABI rejects buffers larger than one host page. Keep the ioctl
+        // header and its variable payload within that limit; the AML transport is page-backed and
+        // zero-padded, so truncating only removes unused tail bytes.
+        let count = args.len().min(
+            base::pagesize()
+                .saturating_sub(mem::size_of::<vfio_acpi_dsm>()),
+        );
         let mut dsm = vec_with_array_field::<vfio_acpi_dsm, u8>(count);
-        dsm[0].argsz = (mem::size_of::<vfio_acpi_dsm>() + mem::size_of_val(args)) as u32;
+        dsm[0].argsz = (mem::size_of::<vfio_acpi_dsm>() + count) as u32;
         dsm[0].padding = 0;
         // SAFETY:
         // Safe as we allocated enough space to hold args
         unsafe {
-            dsm[0].args.as_mut_slice(count).clone_from_slice(args);
+            dsm[0]
+                .args
+                .as_mut_slice(count)
+                .clone_from_slice(&args[..count]);
         }
         // SAFETY:
         // Safe as we are the owner of self and dsm which are valid value
@@ -1522,6 +1534,18 @@ impl VfioDevice {
         Ok((dev_info, dev_type))
     }
 
+    fn reset_if_supported(device_file: &File, dev_info: &vfio_device_info) -> Result<()> {
+        if dev_info.flags & VFIO_DEVICE_FLAGS_RESET == 0 {
+            return Ok(());
+        }
+
+        // SAFETY: VFIO_DEVICE_RESET takes no argument and device_file is a valid VFIO device fd.
+        if unsafe { ioctl(device_file, VFIO_DEVICE_RESET) } < 0 {
+            return Err(VfioError::VfioDeviceReset(get_error()));
+        }
+        Ok(())
+    }
+
     /// Query interrupt information
     /// return: Vector of interrupts information, each of which contains flags and index
     pub fn get_irqs(&self) -> Result<Vec<VfioIrq>> {
@@ -1578,7 +1602,7 @@ impl VfioDevice {
 
             let mut mmaps: Vec<vfio_region_sparse_mmap_area> = Vec::new();
             let mut cap_info: Option<(u32, u32)> = None;
-            let mut msix_region_mmappable = false;
+            let mut preserve_sparse_mmaps = false;
             if reg_info.argsz > argsz {
                 let cap_len: usize = (reg_info.argsz - argsz) as usize;
                 let mut region_with_cap =
@@ -1663,12 +1687,8 @@ impl VfioDevice {
                         for area in areas.iter() {
                             mmaps.push(*area);
                         }
-
-                        // Sparse regions means the driver can decide which parts of the BAR are
-                        // safe to mmap. If that overlaps with the MSIX
-                        // data, that's the decision of the driver.
-                        // This is required for some devices (e.g. NVIDIA vGPUs).
-                        msix_region_mmappable = true;
+                        preserve_sparse_mmaps |=
+                            region_cap_preserves_sparse_mmaps(cap_header.id as u32);
                     } else if cap_header.id as u32 == VFIO_REGION_INFO_CAP_TYPE {
                         if offset + type_cap_sz > region_info_sz {
                             break;
@@ -1682,11 +1702,13 @@ impl VfioDevice {
 
                         cap_info = Some((cap_type_info.type_, cap_type_info.subtype));
                     } else if cap_header.id as u32 == VFIO_REGION_INFO_CAP_MSIX_MAPPABLE {
+                        // This capability allows access to non-MSI-X registers which share a host
+                        // page with MSI-X data. VFIO_DEVICE_SET_IRQS is still required, so the
+                        // MSI-X table and PBA must remain trapped by the VMM.
                         mmaps.push(vfio_region_sparse_mmap_area {
                             offset: 0,
                             size: region_with_cap[0].region_info.size,
                         });
-                        msix_region_mmappable = true;
                     }
 
                     offset = cap_header.next;
@@ -1704,7 +1726,7 @@ impl VfioDevice {
                 offset: reg_info.offset,
                 mmaps,
                 cap_info,
-                msix_region_mmappable,
+                preserve_sparse_mmaps,
             };
             regions.push(region);
         }
@@ -1769,13 +1791,12 @@ impl VfioDevice {
         }
     }
 
-    /// get if the MSIX data with a region is safe to mmap, or if it should be removed
-    /// before mmapping
-    pub fn get_region_msix_mmappable(&self, index: usize) -> bool {
+    /// Return whether driver-provided sparse mappings must be preserved exactly.
+    pub fn preserve_region_sparse_mmaps(&self, index: usize) -> bool {
         match self.regions.get(index) {
-            Some(v) => v.msix_region_mmappable,
+            Some(v) => v.preserve_sparse_mmaps,
             None => {
-                warn!("get_region_msix_mmappable with invalid index: {}", index);
+                warn!("preserve_region_sparse_mmaps with invalid index: {}", index);
                 false
             }
         }
@@ -1996,5 +2017,42 @@ impl VfioPciConfig {
 impl AsRawDescriptor for VfioDevice {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.dev.as_raw_descriptor()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs::File;
+
+    use super::region_cap_preserves_sparse_mmaps;
+    use super::VfioContainer;
+    use super::VfioError;
+    use vfio_sys::VFIO_REGION_INFO_CAP_MSIX_MAPPABLE;
+    use vfio_sys::VFIO_REGION_INFO_CAP_SPARSE_MMAP;
+
+    #[test]
+    fn unconfigured_container_rejects_dma_map_without_panicking() {
+        let container = VfioContainer {
+            container: File::open("/dev/null").unwrap(),
+            groups: HashMap::new(),
+            iommu_type: None,
+        };
+
+        // SAFETY: The missing IOMMU configuration is rejected before any ioctl uses these dummy
+        // addresses.
+        let result = unsafe { container.vfio_dma_map(0, 4096, 0, false) };
+
+        assert!(matches!(result, Err(VfioError::InvalidOperation)));
+    }
+
+    #[test]
+    fn only_sparse_region_caps_preserve_msix_mappings() {
+        assert!(region_cap_preserves_sparse_mmaps(
+            VFIO_REGION_INFO_CAP_SPARSE_MMAP
+        ));
+        assert!(!region_cap_preserves_sparse_mmaps(
+            VFIO_REGION_INFO_CAP_MSIX_MAPPABLE
+        ));
     }
 }

@@ -227,6 +227,14 @@ fn finalize_window(
     }
 }
 
+fn use_reserved_hotplug_window(
+    hotplug_implemented: bool,
+    hotplugged: bool,
+    bar_ranges: &[BarRange],
+) -> bool {
+    hotplugged || (hotplug_implemented && bar_ranges.is_empty())
+}
+
 impl PciDevice for PciBridge {
     fn debug_label(&self) -> String {
         self.device.lock().debug_label()
@@ -358,7 +366,7 @@ impl PciDevice for PciBridge {
         let hotplug_implemented = self.device.lock().hotplug_implemented();
         let hotplugged = self.device.lock().hotplugged();
 
-        if hotplug_implemented || hotplugged {
+        if use_reserved_hotplug_window(hotplug_implemented, hotplugged, bar_ranges) {
             // If bridge is for children hotplug, get desired bridge window size and reserve
             // it for guest OS use.
             // If bridge is hotplugged into the system, get the desired bridge window size
@@ -367,7 +375,9 @@ impl PciDevice for PciBridge {
             window_size = win_size;
             pref_window_size = pref_win_size;
         } else {
-            // Bridge has children connected, get bridge window size from children
+            // A bridge with cold-plugged children must cover their allocated BARs even when its
+            // slot supports later hotplug.  The generic hotplug reservation is deliberately
+            // small and is not sufficient for devices such as integrated GPUs.
             let mut window_end: u64 = 0;
             let mut pref_window_end: u64 = 0;
 
@@ -482,3 +492,21 @@ impl PciDevice for PciBridge {
 }
 
 impl Suspendable for PciBridge {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coldplugged_child_sizes_hotplug_bridge_from_its_bars() {
+        let gpu_bars = [BarRange {
+            addr: 0x1_0000_0000,
+            size: 0x2000_0000,
+            prefetchable: true,
+        }];
+
+        assert!(!use_reserved_hotplug_window(true, false, &gpu_bars));
+        assert!(use_reserved_hotplug_window(true, false, &[]));
+        assert!(use_reserved_hotplug_window(true, true, &gpu_bars));
+    }
+}
