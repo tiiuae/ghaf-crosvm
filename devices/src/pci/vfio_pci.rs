@@ -99,6 +99,10 @@ const PCI_CAP_ID_MSI: u8 = 0x05;
 const PCI_CAP_ID_MSIX: u8 = 0x11;
 const PCI_CAP_ID_PM: u8 = 0x01;
 
+fn vfio_region_is_backed(size: u64) -> bool {
+    size != 0
+}
+
 // Size of the standard PCI config space
 const PCI_CONFIG_SPACE_SIZE: u32 = 0x100;
 // Size of the standard PCIe config space: 4KB
@@ -715,13 +719,15 @@ impl VfioPciDevice {
     ) -> Result<Self, PciDeviceError> {
         let preferred_address = if let Some(bus_num) = hotplug_bus_number {
             debug!("hotplug bus {}", bus_num);
-            PciAddress {
-                // Caller specify pcie bus number for hotplug device
+            let mut address = guest_address.unwrap_or(PciAddress {
                 bus: bus_num,
-                // devfn should be 0, otherwise pcie root port couldn't detect it
                 dev: 0,
                 func: 0,
-            }
+            });
+            // The caller selects the root port. Preserve an explicitly assigned function so
+            // members of one host IOMMU group can remain a single multifunction guest device.
+            address.bus = bus_num;
+            address
         } else if let Some(guest_address) = guest_address {
             debug!("guest PCI address {}", guest_address);
             guest_address
@@ -1168,7 +1174,7 @@ impl VfioPciDevice {
             // these bars should be trapped, so that msix could be emulated.
             let mut mmaps = self.device.get_region_mmap(index);
 
-            if self.msix_cap.is_some() && !self.device.get_region_msix_mmappable(index) {
+            if self.msix_cap.is_some() && !self.device.preserve_region_sparse_mmaps(index) {
                 mmaps = self.remove_bar_mmap_msix(index, mmaps);
             }
             if mmaps.is_empty() {
@@ -1355,6 +1361,17 @@ impl VfioPciDevice {
         let mut mem_bars: Vec<PciBarConfiguration> = Vec::new();
 
         while i <= VFIO_PCI_ROM_REGION_INDEX {
+            let region_size = self.device.get_region_size(i as usize);
+            if !vfio_region_is_backed(region_size) {
+                debug!(
+                    "{}: skipping VFIO PCI region {} because it has no backing storage",
+                    self.debug_label(),
+                    i
+                );
+                i += 1;
+                continue;
+            }
+
             let mut low: u32 = 0xffffffff;
             let offset: u32 = if i == VFIO_PCI_ROM_REGION_INDEX {
                 0x30
@@ -1648,14 +1665,14 @@ impl PciDevice for VfioPciDevice {
                     address.func += 1;
                 }
             }
+            let pci_address = self
+                .pci_address
+                .ok_or(PciDeviceError::PciAllocationFailed)?;
             if let Some(msi_cap) = &mut self.msi_cap {
-                msi_cap.config.set_pci_address(self.pci_address.unwrap());
+                msi_cap.config.set_pci_address(pci_address);
             }
             if let Some(msix_cap) = &mut self.msix_cap {
-                msix_cap
-                    .lock()
-                    .config
-                    .set_pci_address(self.pci_address.unwrap());
+                msix_cap.lock().config.set_pci_address(pci_address);
             }
         }
         self.pci_address.ok_or(PciDeviceError::PciAllocationFailed)
@@ -2137,7 +2154,14 @@ impl Suspendable for VfioPciDevice {
 mod tests {
     use resources::AddressRange;
 
+    use super::vfio_region_is_backed;
     use super::VfioResourceAllocator;
+
+    #[test]
+    fn zero_size_vfio_region_is_not_backed() {
+        assert!(!vfio_region_is_backed(0));
+        assert!(vfio_region_is_backed(1));
+    }
 
     #[test]
     fn no_overlap() {

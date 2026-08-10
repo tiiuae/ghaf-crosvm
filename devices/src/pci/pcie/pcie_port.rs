@@ -330,11 +330,11 @@ impl PciePort {
     }
 
     /// Sets a sender for hot plug or unplug complete.
-    pub fn set_hpc_sender(&mut self, event: Event) {
+    pub fn set_hpc_sender(&mut self, event: Event, operation: HotPlugOperation) {
         self.pcie_config
             .lock()
             .hpc_sender
-            .replace(HotPlugCompleteSender::new(event));
+            .replace(HotPlugCompleteSender::new(event, operation));
     }
 
     pub fn trigger_hp_or_pme_interrupt(&mut self) {
@@ -387,6 +387,19 @@ impl PciePort {
         self.pcie_config.lock().set_slot_status(flag);
     }
 
+    pub fn mark_slot_present_at_boot(&mut self) {
+        let mut pcie_config = self.pcie_config.lock();
+        pcie_config.slot_status |= PCIE_SLTSTA_PDS;
+        if let Some(slot_control) = pcie_config.slot_control.as_mut() {
+            *slot_control = (*slot_control & !PCIE_SLTCTL_PIC) | PCIE_SLTCTL_PIC_ON;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn slot_status(&self) -> u16 {
+        self.pcie_config.lock().slot_status
+    }
+
     pub fn should_trigger_pme(&mut self) -> bool {
         self.pm_config.lock().should_trigger_pme()
     }
@@ -399,13 +412,15 @@ impl PciePort {
 struct HotPlugCompleteSender {
     sender: Event,
     armed: bool,
+    operation: HotPlugOperation,
 }
 
 impl HotPlugCompleteSender {
-    fn new(sender: Event) -> Self {
+    fn new(sender: Event, operation: HotPlugOperation) -> Self {
         Self {
             sender,
             armed: false,
+            operation,
         }
     }
 
@@ -417,9 +432,19 @@ impl HotPlugCompleteSender {
         self.armed
     }
 
+    fn operation(&self) -> HotPlugOperation {
+        self.operation
+    }
+
     fn signal(&self) -> base::Result<()> {
         self.sender.signal()
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HotPlugOperation {
+    Plug,
+    Unplug,
 }
 
 pub struct PcieConfig {
@@ -566,16 +591,38 @@ impl PcieConfig {
                 if old_control != value {
                     let old_pic_state = old_control & PCIE_SLTCTL_PIC;
                     let pic_state = value & PCIE_SLTCTL_PIC;
-                    if old_pic_state == PCIE_SLTCTL_PIC_BLINK && old_pic_state != pic_state {
+                    let indicator_completed = (old_pic_state == PCIE_SLTCTL_PIC_BLINK
+                        && old_pic_state != pic_state)
+                        || (old_pic_state == PCIE_SLTCTL_PIC_ON
+                            && pic_state == PCIE_SLTCTL_PIC_OFF);
+                    if indicator_completed {
                         // The power indicator (PIC) is controled by the guest to indicate the power
                         // state of the slot.
                         // For successful hotplug: OFF => BLINK => (board enabled) => ON
                         // For failed hotplug: OFF => BLINK => (board enable failed) => OFF
                         // For hot unplug: ON => BLINK => (board disabled) => OFF
-                        // hot (un)plug is completed at next slot status write after it changed to
-                        // ON or OFF state.
+                        // Linux can also disable a slot directly from ON => OFF.
+                        // Insertion completion is reported at the next slot status write after the
+                        // indicator reaches ON or OFF.  Removal completion is reported as soon as
+                        // the indicator reaches OFF because Linux may not write Slot Status again.
 
-                        if let Some(sender) = self.hpc_sender.as_mut() {
+                        // Linux does not necessarily write Slot Status again after it has removed
+                        // the last device and turned the power indicator off.  Complete unplug at
+                        // that terminal transition; otherwise the control command waits forever
+                        // even though the guest has already removed the device.  Keep insertion
+                        // completion delayed until the following status acknowledgement so a
+                        // subsequent attention-button event cannot cancel the insertion.
+                        let unplug_completed = pic_state == PCIE_SLTCTL_PIC_OFF
+                            && self.hpc_sender.as_ref().is_some_and(|sender| {
+                                sender.operation() == HotPlugOperation::Unplug
+                            });
+                        if unplug_completed {
+                            if let Some(sender) = self.hpc_sender.take() {
+                                if let Err(e) = sender.signal() {
+                                    error!("Failed to send hot unplug complete signal: {}", e);
+                                }
+                            }
+                        } else if let Some(sender) = self.hpc_sender.as_mut() {
                             sender.arm();
                         }
                     }
@@ -809,5 +856,77 @@ impl<T: PciePortVariant> PcieDevice for T {
 
     fn get_bridge_window_size(&self) -> (u64, u64) {
         self.get_pcie_port().get_bridge_window_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use base::EventWaitResult;
+
+    use super::*;
+
+    #[test]
+    fn direct_power_off_completes_hot_unplug() {
+        let root_cap = Arc::new(Mutex::new(PcieRootCap::new(1, 1)));
+        let mut config = PcieConfig::new(root_cap, true, PcieDevicePortType::RootPort);
+        let interrupt_flags = PCIE_SLTCTL_ABPE | PCIE_SLTCTL_CCIE | PCIE_SLTCTL_HPIE;
+        config.slot_control = Some(PCIE_SLTCTL_PIC_ON | interrupt_flags);
+        config.slot_status = PCIE_SLTSTA_PDS;
+
+        let completion_sender = Event::new().unwrap();
+        let completion_receiver = completion_sender.try_clone().unwrap();
+        config.hpc_sender = Some(HotPlugCompleteSender::new(
+            completion_sender,
+            HotPlugOperation::Unplug,
+        ));
+
+        config.write_pcie_cap(
+            PCIE_SLTCTL_OFFSET,
+            &(PCIE_SLTCTL_PIC_OFF | interrupt_flags).to_le_bytes(),
+        );
+
+        assert!(config.removed_downstream_valid);
+        assert_eq!(config.slot_status & PCIE_SLTSTA_PDS, 0);
+        assert_eq!(
+            completion_receiver.wait_timeout(Duration::ZERO).unwrap(),
+            EventWaitResult::Signaled
+        );
+        assert!(config.hpc_sender.is_none());
+    }
+
+    #[test]
+    fn hot_plug_completion_waits_for_status_acknowledgement() {
+        let root_cap = Arc::new(Mutex::new(PcieRootCap::new(1, 1)));
+        let mut config = PcieConfig::new(root_cap, true, PcieDevicePortType::RootPort);
+        let interrupt_flags = PCIE_SLTCTL_ABPE | PCIE_SLTCTL_CCIE | PCIE_SLTCTL_HPIE;
+        config.slot_control = Some(PCIE_SLTCTL_PIC_BLINK | interrupt_flags);
+        config.slot_status = PCIE_SLTSTA_PDS;
+
+        let completion_sender = Event::new().unwrap();
+        let completion_receiver = completion_sender.try_clone().unwrap();
+        config.hpc_sender = Some(HotPlugCompleteSender::new(
+            completion_sender,
+            HotPlugOperation::Plug,
+        ));
+
+        config.write_pcie_cap(
+            PCIE_SLTCTL_OFFSET,
+            &(PCIE_SLTCTL_PIC_ON | interrupt_flags).to_le_bytes(),
+        );
+
+        assert_eq!(
+            completion_receiver.wait_timeout(Duration::ZERO).unwrap(),
+            EventWaitResult::TimedOut
+        );
+
+        config.write_pcie_cap(PCIE_SLTSTA_OFFSET, &PCIE_SLTSTA_CC.to_le_bytes());
+
+        assert_eq!(
+            completion_receiver.wait_timeout(Duration::ZERO).unwrap(),
+            EventWaitResult::Signaled
+        );
+        assert!(config.hpc_sender.is_none());
     }
 }

@@ -34,8 +34,10 @@ use remain::sorted;
 use thiserror::Error;
 use vm_memory::GuestMemory;
 
+mod host_tpm;
 mod swtpm;
 mod vtpm_proxy;
+use self::host_tpm::HostTpm;
 use self::swtpm::Swtpm;
 pub use self::vtpm_proxy::VtpmProxy;
 
@@ -251,6 +253,9 @@ enum TpmBackendConfig {
     Swtpm {
         socket: PathBuf,
     },
+    HostTpm {
+        device: PathBuf,
+    },
 }
 
 /// Module for creating a Virtio TPM device.
@@ -271,6 +276,13 @@ impl VirtioTpmModule {
             backend: TpmBackendConfig::Swtpm { socket },
         }
     }
+
+    /// Create a VirtioTpmModule backed by a Linux TPM character device.
+    pub fn new_host_tpm(device: PathBuf) -> Self {
+        Self {
+            backend: TpmBackendConfig::HostTpm { device },
+        }
+    }
 }
 
 impl VirtioDeviceModule for VirtioTpmModule {
@@ -282,6 +294,7 @@ impl VirtioDeviceModule for VirtioTpmModule {
         let backend: Box<dyn TpmBackend> = match &self.backend {
             TpmBackendConfig::VtpmProxy => Box::new(VtpmProxy::new()),
             TpmBackendConfig::Swtpm { socket } => Box::new(Swtpm::connect(socket)?),
+            TpmBackendConfig::HostTpm { device } => Box::new(HostTpm::open(device)?),
         };
         let dev = Tpm::new(backend, virtio::base_features(args.protection_type));
         Ok(Box::new(dev))
@@ -290,10 +303,10 @@ impl VirtioDeviceModule for VirtioTpmModule {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     fn create_jail(&self, jail_config: &JailConfig) -> anyhow::Result<Option<Minijail>> {
         let use_dbus = matches!(self.backend, TpmBackendConfig::VtpmProxy);
-        let device_name = if use_dbus {
-            "vtpm_proxy_device"
-        } else {
-            "swtpm_device"
+        let device_name = match self.backend {
+            TpmBackendConfig::VtpmProxy => "vtpm_proxy_device",
+            TpmBackendConfig::Swtpm { .. } => "swtpm_device",
+            TpmBackendConfig::HostTpm { .. } => "host_tpm_device",
         };
         let mut config = jail::SandboxConfig::new(jail_config, device_name);
         config.bind_mounts = use_dbus;

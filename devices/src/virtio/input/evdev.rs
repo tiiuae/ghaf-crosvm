@@ -112,6 +112,16 @@ fn errno() -> base::Error {
     base::Error::last()
 }
 
+fn handle_serial_error(err: base::Error) -> Result<String> {
+    // An input device is not required to provide a unique identifier. The
+    // Linux input core reports a missing identifier as ENOENT.
+    if err.errno() == libc::ENOENT {
+        Ok(String::new())
+    } else {
+        Err(InputError::EvdevSerialError(err))
+    }
+}
+
 fn string_from_bytes_with_nul(buffer: &[u8], mut len: usize) -> Result<String> {
     // Trim NUL byte.
     if len > 0 && buffer[len] == 0 {
@@ -165,7 +175,7 @@ pub fn serial_name<T: AsRawDescriptor>(descriptor: &T) -> Result<String> {
         unsafe { ioctl_with_mut_ref(descriptor, EVIOCGUNIQ, &mut uniq) }
     };
     if len < 0 {
-        return Err(InputError::EvdevSerialError(errno()));
+        return handle_serial_error(errno());
     }
     string_from_bytes_with_nul(&uniq.buffer, len as usize)
 }
@@ -273,5 +283,26 @@ pub fn ungrab_evdev<T: AsRawDescriptor>(descriptor: &mut T) -> Result<()> {
         Ok(())
     } else {
         Err(InputError::EvdevGrabError(errno()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_serial_name_is_empty() {
+        assert_eq!(
+            handle_serial_error(base::Error::new(libc::ENOENT)).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn unexpected_serial_error_is_preserved() {
+        assert!(matches!(
+            handle_serial_error(base::Error::new(libc::ENOTTY)),
+            Err(InputError::EvdevSerialError(err)) if err.errno() == libc::ENOTTY
+        ));
     }
 }

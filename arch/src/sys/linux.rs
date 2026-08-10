@@ -60,7 +60,15 @@ pub fn add_goldfish_battery(
     let (control_tube, response_tube) =
         Tube::pair().map_err(DeviceRegistrationError::CreateTube)?;
 
-    #[cfg(feature = "power-monitor-powerd")]
+    #[cfg(feature = "power-monitor-sysfs")]
+    let (create_monitor, create_client) = (
+        Some(Box::new(power_monitor::sysfs::SysfsMonitor::connect)
+            as Box<dyn power_monitor::CreatePowerMonitorFn>),
+        Some(Box::new(power_monitor::sysfs::SysfsClient::connect)
+            as Box<dyn power_monitor::CreatePowerClientFn>),
+    );
+
+    #[cfg(all(not(feature = "power-monitor-sysfs"), feature = "power-monitor-powerd"))]
     let (create_monitor, create_client) = (
         Some(
             Box::new(power_monitor::powerd::monitor::DBusMonitor::connect)
@@ -70,7 +78,7 @@ pub fn add_goldfish_battery(
             as Box<dyn power_monitor::CreatePowerClientFn>),
     );
 
-    #[cfg(not(feature = "power-monitor-powerd"))]
+    #[cfg(not(any(feature = "power-monitor-sysfs", feature = "power-monitor-powerd")))]
     let (create_monitor, create_client) = (None, None);
 
     let irq_evt = devices::IrqLevelEvent::new().map_err(DeviceRegistrationError::EventCreate)?;

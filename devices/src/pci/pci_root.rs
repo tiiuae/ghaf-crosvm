@@ -12,6 +12,7 @@ use std::sync::Weak;
 
 use anyhow::Context;
 use base::error;
+use base::Event;
 use base::MemoryMapping;
 use base::MemoryMappingBuilder;
 use base::Protection;
@@ -127,6 +128,7 @@ pub enum PciRootCommand {
     Add(PciAddress, Arc<Mutex<dyn BusDevice>>),
     AddBridge(Arc<Mutex<PciBus>>),
     Remove(PciAddress),
+    Barrier(Event),
     Kill,
 }
 

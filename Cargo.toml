@@ -439,6 +439,9 @@ libvda-stub = ["devices/libvda-stub"]
 ## `org.chromium.PowerManager` dbus service.
 power-monitor-powerd = ["arch/power-monitor-powerd"]
 
+## Enables battery and AC reporting through Linux's `/sys/class/power_supply`.
+power-monitor-sysfs = ["arch/power-monitor-sysfs"]
+
 ## Enables a virtualized TPM device that uses the `org.chromium.Vtpm` dbus service.
 vtpm = ["device_virtio_tpm"]
 
@@ -481,6 +484,7 @@ all-default = [
     "noncoherent-dma",
     "pci-hotplug",
     "power-monitor-powerd",
+    "power-monitor-sysfs",
     "pvclock",
     "registered_events",
     "slirp",

@@ -70,6 +70,10 @@ pub struct VfioOption {
     /// The symbol that labels the overlay device tree node which corresponds to this
     /// VFIO device.
     pub dt_symbol: Option<String>,
+
+    /// Place the device behind a hotplug-capable root port so it can be removed and re-added.
+    #[serde(default)]
+    pub removable: bool,
 }
 
 #[derive(Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -466,6 +470,24 @@ mod tests {
         assert_eq!(vfio.path, PathBuf::from("/path/to/dev"));
         assert_eq!(vfio.iommu, IommuDevType::NoIommu);
         assert_eq!(vfio.guest_address, None);
+        assert!(!vfio.removable);
+    }
+
+    #[test]
+    fn vfio_pci_removable() {
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &[
+                "--vfio",
+                "/sys/bus/pci/devices/0000:00:1f.3,removable=true",
+                "/dev/null",
+            ],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        assert!(config.vfio.first().unwrap().removable);
     }
 
     #[test]

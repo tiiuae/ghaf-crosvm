@@ -9,6 +9,7 @@
 use crate::protos::power_supply_properties::power_supply_properties;
 use crate::protos::power_supply_properties::PowerSupplyProperties;
 use crate::BatteryData;
+use crate::BatteryHealth;
 use crate::BatteryStatus;
 use crate::PowerData;
 
@@ -49,6 +50,7 @@ impl From<PowerSupplyProperties> for PowerData {
 
             Some(BatteryData {
                 status,
+                health: BatteryHealth::Unknown,
                 percent,
                 voltage,
                 current,

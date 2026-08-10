@@ -501,15 +501,25 @@ pub struct VfioRemoveSubCommand {
 }
 
 #[derive(FromArgs)]
+#[argh(subcommand, name = "list")]
+/// List attached host VFIO sysfs paths.
+pub struct VfioListSubCommand {
+    #[argh(positional, arg_name = "VM_SOCKET")]
+    /// VM Socket path
+    pub socket_path: String,
+}
+
+#[derive(FromArgs)]
 #[argh(subcommand)]
 pub enum VfioSubCommand {
     Add(VfioAddSubCommand),
+    List(VfioListSubCommand),
     Remove(VfioRemoveSubCommand),
 }
 
 #[derive(FromArgs)]
 #[argh(subcommand, name = "vfio")]
-/// add/remove host vfio pci device into guest
+/// add, remove, or list host VFIO PCI devices in a guest
 pub struct VfioCrosvmCommand {
     #[argh(subcommand)]
     pub command: VfioSubCommand,
@@ -2079,6 +2089,11 @@ pub struct RunCommand {
     /// vCPU threads
     pub task_profiles: Vec<String>,
 
+    #[cfg(feature = "vtpm")]
+    #[argh(option, arg_name = "PATH")]
+    /// enable virtio-tpm backed by a Linux TPM character device
+    pub tpm_device: Option<PathBuf>,
+
     #[argh(
         option,
         arg_name = "[path=]PATH[,width=WIDTH][,height=HEIGHT][,name=NAME]",
@@ -2736,8 +2751,13 @@ impl TryFrom<RunCommand> for super::config::Config {
         #[cfg(feature = "vtpm")]
         {
             let use_vtpm_proxy = cmd.vtpm_proxy.unwrap_or_default();
-            if use_vtpm_proxy && cmd.swtpm.is_some() {
-                return Err("`vtpm-proxy` and `swtpm` cannot be specified together".to_string());
+            let backend_count = usize::from(use_vtpm_proxy)
+                + usize::from(cmd.swtpm.is_some())
+                + usize::from(cmd.tpm_device.is_some());
+            if backend_count > 1 {
+                return Err(
+                    "`vtpm-proxy`, `swtpm`, and `tpm-device` are mutually exclusive".to_string(),
+                );
             }
             if use_vtpm_proxy {
                 cfg.virtio_device_modules
@@ -2746,6 +2766,10 @@ impl TryFrom<RunCommand> for super::config::Config {
             if let Some(socket) = cmd.swtpm {
                 cfg.virtio_device_modules
                     .push(device_virtio_tpm::VirtioTpmModule::new_swtpm(socket).into());
+            }
+            if let Some(device) = cmd.tpm_device {
+                cfg.virtio_device_modules
+                    .push(device_virtio_tpm::VirtioTpmModule::new_host_tpm(device).into());
             }
         }
 
@@ -3318,6 +3342,10 @@ mod tests {
         let cmd = RunCommand::from_args(&[], &["--swtpm", "/run/swtpm.sock", "/dev/null"]).unwrap();
         assert_eq!(cmd.swtpm, Some(PathBuf::from("/run/swtpm.sock")));
 
+        let cmd =
+            RunCommand::from_args(&[], &["--tpm-device", "/dev/tpmrm0", "/dev/null"]).unwrap();
+        assert_eq!(cmd.tpm_device, Some(PathBuf::from("/dev/tpmrm0")));
+
         let cmd = RunCommand::from_args(
             &[],
             &["--vtpm-proxy", "--swtpm", "/run/swtpm.sock", "/dev/null"],
@@ -3329,7 +3357,27 @@ mod tests {
         };
         assert_eq!(
             error,
-            "`vtpm-proxy` and `swtpm` cannot be specified together"
+            "`vtpm-proxy`, `swtpm`, and `tpm-device` are mutually exclusive"
+        );
+
+        let cmd = RunCommand::from_args(
+            &[],
+            &[
+                "--swtpm",
+                "/run/swtpm.sock",
+                "--tpm-device",
+                "/dev/tpmrm0",
+                "/dev/null",
+            ],
+        )
+        .unwrap();
+        let error = match crate::crosvm::config::Config::try_from(cmd) {
+            Ok(_) => panic!("accepted mutually exclusive vTPM backends"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "`vtpm-proxy`, `swtpm`, and `tpm-device` are mutually exclusive"
         );
     }
 

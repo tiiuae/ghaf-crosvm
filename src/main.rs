@@ -77,7 +77,6 @@ use vm_control::client::do_swap_status;
 use vm_control::client::do_usb_attach;
 use vm_control::client::do_usb_detach;
 use vm_control::client::do_usb_list;
-#[cfg(feature = "balloon")]
 use vm_control::client::handle_request;
 use vm_control::client::vms_request;
 #[cfg(feature = "gpu")]
@@ -300,8 +299,9 @@ fn modify_vfio(cmd: cmdline::VfioCrosvmCommand) -> std::result::Result<(), ()> {
                 },
                 add: true,
             };
-            (request, c.socket_path, c.vfio_path)
+            (request, c.socket_path, Some(c.vfio_path))
         }
+        cmdline::VfioSubCommand::List(c) => (VmRequest::ListVfioDevices, c.socket_path, None),
         cmdline::VfioSubCommand::Remove(c) => {
             let request = VmRequest::HotPlugVfioCommand {
                 device: HotPlugDeviceInfo {
@@ -311,15 +311,22 @@ fn modify_vfio(cmd: cmdline::VfioCrosvmCommand) -> std::result::Result<(), ()> {
                 },
                 add: false,
             };
-            (request, c.socket_path, c.vfio_path)
+            (request, c.socket_path, Some(c.vfio_path))
         }
     };
-    if !vfio_path.exists() || !vfio_path.is_dir() {
-        error!("Invalid host sysfs path: {:?}", vfio_path);
-        return Err(());
+    if let Some(vfio_path) = vfio_path {
+        if !vfio_path.exists() || !vfio_path.is_dir() {
+            error!("Invalid host sysfs path: {:?}", vfio_path);
+            return Err(());
+        }
     }
 
-    vms_request(&request, socket_path)?;
+    if matches!(&request, VmRequest::ListVfioDevices) {
+        let response = handle_request(&request, socket_path)?;
+        println!("{response}");
+    } else {
+        vms_request(&request, socket_path)?;
+    }
     Ok(())
 }
 
