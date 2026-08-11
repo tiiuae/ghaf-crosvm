@@ -179,8 +179,13 @@ pub fn generate_platform_bus(
             .map_err(DeviceRegistrationError::AllocateIoResource)?;
 
         // If guest memory is private, don't wait for the first access to mmap the device.
-        if protection_type.isolates_memory() {
-            device.regions_mmap_early(vm);
+        if protection_type.isolates_memory() || device.map_early() {
+            if let Err(error) = device.regions_mmap_early(vm) {
+                if device.map_early() {
+                    return Err(DeviceRegistrationError::MapVfioPlatformMemory(error));
+                }
+                warn!("failed to map protected VFIO platform memory early: {error:#}");
+            }
         }
 
         let mut keep_rds = device.keep_rds();

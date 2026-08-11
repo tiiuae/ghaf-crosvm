@@ -202,6 +202,18 @@ pub struct MemOptions {
     /// Amount of guest memory in MiB.
     #[serde(default)]
     pub size: Option<u64>,
+    /// Guest physical base address of RAM.
+    #[serde(default)]
+    pub base: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, FromKeyValues, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct PlatformMmioOptions {
+    /// Guest physical base address of the platform MMIO aperture.
+    pub base: u64,
+    /// Size in bytes of the platform MMIO aperture.
+    pub size: u64,
 }
 
 fn deserialize_swap_interval<'de, D: Deserializer<'de>>(
@@ -709,6 +721,7 @@ pub struct Config {
     #[cfg(all(feature = "media", feature = "video-decoder"))]
     pub media_decoder: Vec<VideoDeviceConfig>,
     pub memory: Option<u64>,
+    pub memory_base: Option<u64>,
     pub memory_file: Option<PathBuf>,
     pub mmio_address_ranges: Vec<AddressRange>,
     #[cfg(target_arch = "aarch64")]
@@ -726,12 +739,15 @@ pub struct Config {
     pub no_smt: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub nvidia_bpmp_host: Option<PathBuf>,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub nvidia_dce_host: Option<PathBuf>,
     pub params: Vec<String>,
     pub pci_config: PciConfig,
     #[cfg(feature = "pci-hotplug")]
     pub pci_hotplug_slots: Option<u8>,
     pub per_vm_core_scheduling: bool,
     pub pflash_parameters: Option<PflashParameters>,
+    pub platform_mmio: Option<PlatformMmioOptions>,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub pmem_ext2: Vec<crate::crosvm::sys::config::PmemExt2Option>,
     pub pmems: Vec<PmemOption>,
@@ -955,6 +971,7 @@ impl Default for Config {
             #[cfg(all(feature = "media", feature = "video-decoder"))]
             media_decoder: Default::default(),
             memory: None,
+            memory_base: None,
             memory_file: None,
             mmio_address_ranges: Vec::new(),
             #[cfg(target_arch = "aarch64")]
@@ -972,12 +989,15 @@ impl Default for Config {
             no_smt: false,
             #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
             nvidia_bpmp_host: None,
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            nvidia_dce_host: None,
             params: Vec::new(),
             pci_config: Default::default(),
             #[cfg(feature = "pci-hotplug")]
             pci_hotplug_slots: None,
             per_vm_core_scheduling: false,
             pflash_parameters: None,
+            platform_mmio: None,
             #[cfg(any(target_os = "android", target_os = "linux"))]
             pmem_ext2: Vec::new(),
             pmems: Vec::new(),
@@ -1071,6 +1091,43 @@ impl Default for Config {
 pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
     if cfg.executable_path.is_none() {
         return Err("Executable is not specified".to_string());
+    }
+
+    if (cfg.memory_base.is_some() || cfg.platform_mmio.is_some()) && !cfg!(target_arch = "aarch64")
+    {
+        return Err("explicit RAM/platform MMIO layout is only supported on AArch64".to_string());
+    }
+
+    let memory_size = cfg
+        .memory
+        .unwrap_or(256)
+        .checked_mul(1024 * 1024)
+        .ok_or("requested memory size too large")?;
+    let memory_base = cfg.memory_base.unwrap_or(0x8000_0000);
+    if cfg.memory_base.is_some() {
+        if memory_base % 4096 != 0 {
+            return Err("RAM base must be 4096-byte aligned".to_string());
+        }
+    }
+    let memory_end = memory_base
+        .checked_add(memory_size)
+        .ok_or("RAM range overflows the guest address space")?;
+    if let Some(platform_mmio) = &cfg.platform_mmio {
+        if platform_mmio.base % 4096 != 0 || platform_mmio.size % 4096 != 0 {
+            return Err("platform MMIO base and size must be 4096-byte aligned".to_string());
+        }
+        if platform_mmio.size == 0 {
+            return Err("platform MMIO size must be non-zero".to_string());
+        }
+        let platform_end = platform_mmio
+            .base
+            .checked_add(platform_mmio.size)
+            .ok_or("platform MMIO range overflows the guest address space")?;
+        if cfg!(target_arch = "aarch64") {
+            if memory_base < platform_end && platform_mmio.base < memory_end {
+                return Err("RAM and platform MMIO ranges overlap".to_string());
+            }
+        }
     }
 
     #[cfg(feature = "gpu")]
@@ -1592,6 +1649,72 @@ mod tests {
 
         let res: MemOptions = from_key_values("size=0x4000").unwrap();
         assert_eq!(res.size, Some(16384));
+
+        let res: MemOptions = from_key_values("size=1024,base=0x2000000000").unwrap();
+        assert_eq!(res.size, Some(1024));
+        assert_eq!(res.base, Some(0x20_0000_0000));
+
+        let platform: PlatformMmioOptions =
+            from_key_values("base=0x60000000,size=0x1fa0000000").unwrap();
+        assert_eq!(platform.base, 0x6000_0000);
+        assert_eq!(platform.size, 0x1f_a000_0000);
+    }
+
+    fn layout_config() -> Config {
+        Config {
+            executable_path: Some(Executable::Kernel(PathBuf::from("/dev/null"))),
+            memory: Some(1024),
+            memory_base: Some(0x20_0000_0000),
+            platform_mmio: Some(PlatformMmioOptions {
+                base: 0x6000_0000,
+                size: 0x1f_a000_0000,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_explicit_layout_on_unsupported_architecture() {
+        let result = validate_config(&mut layout_config());
+        if cfg!(target_arch = "aarch64") {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert_eq!(
+                result,
+                Err("explicit RAM/platform MMIO layout is only supported on AArch64".to_string())
+            );
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn rejects_invalid_explicit_layouts() {
+        let mut misaligned = layout_config();
+        misaligned.memory_base = Some(0x20_0000_0001);
+        assert_eq!(
+            validate_config(&mut misaligned),
+            Err("RAM base must be 4096-byte aligned".to_string())
+        );
+
+        let mut overlap = layout_config();
+        overlap.platform_mmio = Some(PlatformMmioOptions {
+            base: 0x20_0000_0000,
+            size: 0x1000,
+        });
+        assert_eq!(
+            validate_config(&mut overlap),
+            Err("RAM and platform MMIO ranges overlap".to_string())
+        );
+
+        let mut overflow = layout_config();
+        overflow.platform_mmio = Some(PlatformMmioOptions {
+            base: u64::MAX - 0xfff,
+            size: 0x2000,
+        });
+        assert_eq!(
+            validate_config(&mut overflow),
+            Err("platform MMIO range overflows the guest address space".to_string())
+        );
     }
 
     #[test]
