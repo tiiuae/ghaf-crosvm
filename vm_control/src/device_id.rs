@@ -30,6 +30,7 @@ pub enum PlatformDeviceId {
     FwCfg = 23,
     SmcccTrng = 24,
     HvcDevicePowerManager = 25,
+    NvidiaBpmpHost = 26,
     Mock = 0xff,
 }
 

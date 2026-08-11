@@ -518,6 +518,8 @@ pub struct VmComponents {
     pub no_i8042: bool,
     pub no_rtc: bool,
     pub no_smt: bool,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub nvidia_bpmp_host: Option<File>,
 
     pub pci_config: PciConfig,
     pub pflash_block_size: u32,
