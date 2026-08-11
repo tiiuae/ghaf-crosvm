@@ -30,6 +30,8 @@ use arch::VmImage;
 use base::warn;
 use base::MemoryMappingBuilder;
 use base::SendTube;
+#[cfg(target_os = "linux")]
+use base::SharedMemory;
 use base::Tube;
 use devices::serial_device::SerialHardware;
 use devices::serial_device::SerialParameters;
@@ -46,6 +48,8 @@ use devices::IrqChipAArch64;
 use devices::IrqEventSource;
 #[cfg(target_os = "linux")]
 use devices::NvidiaBpmpHost;
+#[cfg(target_os = "linux")]
+use devices::NvidiaDceHost;
 use devices::PciAddress;
 use devices::PciConfigMmio;
 use devices::PciDevice;
@@ -60,6 +64,14 @@ use devices::VirtCpufreqV2;
 use devices::NVIDIA_BPMP_MMIO_BASE;
 #[cfg(target_os = "linux")]
 use devices::NVIDIA_BPMP_MMIO_SIZE;
+#[cfg(target_os = "linux")]
+use devices::NVIDIA_DCE_EVENT_PAYLOAD_BASE;
+#[cfg(target_os = "linux")]
+use devices::NVIDIA_DCE_EVENT_PAYLOAD_SIZE;
+#[cfg(target_os = "linux")]
+use devices::NVIDIA_DCE_MMIO_BASE;
+#[cfg(target_os = "linux")]
+use devices::NVIDIA_DCE_MMIO_SIZE;
 use fdt::PciAddressSpace;
 #[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
@@ -237,14 +249,13 @@ impl PayloadType {
 // When static swiotlb allocation is required, returns the address it should be allocated at.
 // Otherwise, returns None.
 fn get_swiotlb_addr(
+    memory_base: u64,
     memory_size: u64,
     swiotlb_size: u64,
     hypervisor: &(impl Hypervisor + ?Sized),
 ) -> Option<GuestAddress> {
     if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
-        Some(GuestAddress(
-            AARCH64_PHYS_MEM_START + memory_size - swiotlb_size,
-        ))
+        Some(GuestAddress(memory_base + memory_size - swiotlb_size))
     } else {
         None
     }
@@ -253,10 +264,14 @@ fn get_swiotlb_addr(
 #[sorted]
 #[derive(Error, Debug)]
 pub enum Error {
+    #[error("failed to add NVIDIA DCE event payload: {0}")]
+    AddNvidiaDcePayload(base::Error),
     #[error("failed to allocate IRQ number")]
     AllocateIrq,
     #[error("bios could not be loaded: {0}")]
     BiosLoadFailure(arch::LoadImageError),
+    #[error("failed to create NVIDIA DCE event payload: {0}")]
+    BuildNvidiaDcePayload(base::Error),
     #[error("failed to build arm pvtime memory: {0}")]
     BuildPvtimeError(base::MmapError),
     #[error("unable to clone an Event: {0}")]
@@ -265,10 +280,14 @@ pub enum Error {
     CloneIrqChip(base::Error),
     #[error("the given kernel command line was invalid: {0}")]
     Cmdline(kernel_cmdline::Error),
+    #[error("bad RAM configuration: {0}")]
+    ConfigureMemory(String),
     #[error("bad PCI CAM configuration: {0}")]
     ConfigurePciCam(String),
     #[error("bad PCI mem configuration: {0}")]
     ConfigurePciMem(String),
+    #[error("bad platform MMIO configuration: {0}")]
+    ConfigurePlatformMmio(String),
     #[error("failed to configure CPU Frequencies: {0}")]
     CpuFrequencies(base::Error),
     #[error("failed to configure CPU topology: {0}")]
@@ -281,6 +300,8 @@ pub enum Error {
     CreateFdt(cros_fdt::Error),
     #[error("failed to create GIC: {0}")]
     CreateGICFailure(base::Error),
+    #[error("unable to create NVIDIA DCE host bridge: {0}")]
+    CreateNvidiaDce(io::Error),
     #[error("failed to create a PCI root hub: {0}")]
     CreatePciRoot(arch::DeviceRegistrationError),
     #[error("failed to create platform bus: {0}")]
@@ -321,6 +342,8 @@ pub enum Error {
     KernelLoadFailure(kernel_loader::Error),
     #[error("error loading Kernel from Elf image: {0}")]
     LoadElfKernel(kernel_loader::Error),
+    #[error("failed to map NVIDIA DCE event payload: {0}")]
+    MapNvidiaDcePayload(base::MmapError),
     #[error("failed to map arm pvtime memory: {0}")]
     MapPvtimeError(base::Error),
     #[error("missing power manager for assigned devices")]
@@ -345,6 +368,8 @@ pub enum Error {
     RegisterIrqfd(base::Error),
     #[error("error registering NVIDIA BPMP host bridge: {0}")]
     RegisterNvidiaBpmp(BusError),
+    #[error("error registering NVIDIA DCE host bridge: {0}")]
+    RegisterNvidiaDce(BusError),
     #[error("error registering PCI bus: {0}")]
     RegisterPci(BusError),
     #[error("error registering virtual cpufreq device: {0}")]
@@ -359,6 +384,8 @@ pub enum Error {
     SetReg(base::Error),
     #[error("failed to set up guest memory: {0}")]
     SetupGuestMemory(GuestMemoryError),
+    #[error("failed to start NVIDIA DCE event relay: {0}")]
+    StartNvidiaDce(io::Error),
     #[error("this function isn't supported")]
     Unsupported,
     #[error("failed to initialize VCPU: {0}")]
@@ -377,13 +404,11 @@ fn load_kernel(
     guest_mem: &GuestMemory,
     kernel_start: GuestAddress,
     mut kernel_image: &mut File,
+    memory_base: u64,
 ) -> Result<LoadedKernel> {
-    if let Ok(elf_kernel) = kernel_loader::load_elf(
-        guest_mem,
-        kernel_start,
-        &mut kernel_image,
-        AARCH64_PHYS_MEM_START,
-    ) {
+    if let Ok(elf_kernel) =
+        kernel_loader::load_elf(guest_mem, kernel_start, &mut kernel_image, memory_base)
+    {
         return Ok(elf_kernel);
     }
 
@@ -428,8 +453,10 @@ fn main_memory_size(components: &VmComponents, hypervisor: &(impl Hypervisor + ?
 }
 
 pub struct ArchMemoryLayout {
+    memory_base: u64,
     pci_cam: AddressRange,
     pci_mem: AddressRange,
+    platform_mmio: Option<AddressRange>,
 }
 
 impl arch::LinuxArch for AArch64 {
@@ -439,6 +466,7 @@ impl arch::LinuxArch for AArch64 {
     fn arch_memory_layout(
         components: &VmComponents,
     ) -> std::result::Result<Self::ArchMemoryLayout, Self::Error> {
+        let memory_base = components.memory_base.unwrap_or(AARCH64_PHYS_MEM_START);
         let (pci_cam_start, pci_cam_size) = match components.pci_config.cam {
             Some(MemoryRegionConfig { start, size }) => {
                 (start, size.unwrap_or(AARCH64_PCI_CAM_SIZE_DEFAULT))
@@ -473,20 +501,54 @@ impl arch::LinuxArch for AArch64 {
             .unwrap(),
         };
 
-        Ok(ArchMemoryLayout { pci_cam, pci_mem })
+        let memory = AddressRange::from_start_and_size(memory_base, components.memory_size)
+            .ok_or_else(|| Error::ConfigureMemory("region overflowed".to_string()))?;
+        if !memory.intersect(pci_cam).is_empty() || !memory.intersect(pci_mem).is_empty() {
+            return Err(Error::ConfigureMemory(
+                "RAM overlaps a PCI address-space region".to_string(),
+            ));
+        }
+
+        let platform_mmio = components
+            .platform_mmio
+            .map(|MemoryRegionConfig { start, size }| {
+                AddressRange::from_start_and_size(
+                    start,
+                    size.expect("platform MMIO size must be provided"),
+                )
+                .ok_or_else(|| Error::ConfigurePlatformMmio("region overflowed".to_string()))
+            })
+            .transpose()?;
+        if let Some(platform_mmio) = platform_mmio {
+            if !platform_mmio.intersect(memory).is_empty()
+                || !platform_mmio.intersect(pci_cam).is_empty()
+                || !platform_mmio.intersect(pci_mem).is_empty()
+            {
+                return Err(Error::ConfigurePlatformMmio(
+                    "region overlaps RAM or PCI address space".to_string(),
+                ));
+            }
+        }
+
+        Ok(ArchMemoryLayout {
+            memory_base,
+            pci_cam,
+            pci_mem,
+            platform_mmio,
+        })
     }
 
     /// Returns a Vec of the valid memory addresses.
     /// These should be used to configure the GuestMemory structure for the platform.
     fn guest_memory_layout(
         components: &VmComponents,
-        _arch_memory_layout: &Self::ArchMemoryLayout,
+        arch_memory_layout: &Self::ArchMemoryLayout,
         hypervisor: &impl Hypervisor,
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
         let main_memory_size = main_memory_size(components, hypervisor);
 
         let mut memory_regions = vec![(
-            GuestAddress(AARCH64_PHYS_MEM_START),
+            GuestAddress(arch_memory_layout.memory_base),
             main_memory_size,
             MemoryRegionOptions::new().align(get_block_size()),
         )];
@@ -501,7 +563,12 @@ impl arch::LinuxArch for AArch64 {
         }
 
         if let Some(size) = components.swiotlb {
-            if let Some(addr) = get_swiotlb_addr(components.memory_size, size, hypervisor) {
+            if let Some(addr) = get_swiotlb_addr(
+                arch_memory_layout.memory_base,
+                components.memory_size,
+                size,
+                hypervisor,
+            ) {
                 memory_regions.push((
                     addr,
                     size,
@@ -519,10 +586,25 @@ impl arch::LinuxArch for AArch64 {
     ) -> SystemAllocatorConfig {
         let guest_phys_end = 1u64 << vm.get_guest_phys_addr_bits();
         // The platform MMIO region is immediately past the end of RAM.
-        let plat_mmio_base = vm.get_memory().end_addr().offset();
-        let plat_mmio_size = AARCH64_PLATFORM_MMIO_SIZE;
+        let (plat_mmio_base, plat_mmio_size) = arch_memory_layout
+            .platform_mmio
+            .map(|range| {
+                (
+                    range.start,
+                    range.len().expect("non-empty platform MMIO range"),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    vm.get_memory().end_addr().offset(),
+                    AARCH64_PLATFORM_MMIO_SIZE,
+                )
+            });
         // The high MMIO region is the rest of the address space after the platform MMIO region.
-        let high_mmio_base = plat_mmio_base + plat_mmio_size;
+        let high_mmio_base = std::cmp::max(
+            plat_mmio_base + plat_mmio_size,
+            vm.get_memory().end_addr().offset(),
+        );
         let high_mmio_size = guest_phys_end
             .checked_sub(high_mmio_base)
             .unwrap_or_else(|| {
@@ -566,6 +648,7 @@ impl arch::LinuxArch for AArch64 {
         let mem = vm.get_memory().clone();
 
         let main_memory_size = main_memory_size(&components, vm.get_hypervisor());
+        let memory_base = arch_memory_layout.memory_base;
 
         // Load pvmfw early because it tells the hypervisor this is a pVM which affects
         // the behavior of calls like Hypervisor::check_capability
@@ -595,9 +678,9 @@ impl arch::LinuxArch for AArch64 {
         });
         let payload_address = match fdt_position {
             // If FDT is at the start RAM, the payload needs to go somewhere after it.
-            FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_FDT_MAX_SIZE),
+            FdtPosition::Start => GuestAddress(memory_base + AARCH64_FDT_MAX_SIZE),
             // Otherwise, put the payload at the start of RAM.
-            FdtPosition::End | FdtPosition::AfterPayload => GuestAddress(AARCH64_PHYS_MEM_START),
+            FdtPosition::End | FdtPosition::AfterPayload => GuestAddress(memory_base),
         };
 
         // separate out image loading from other setup to get a specific error for
@@ -619,7 +702,7 @@ impl arch::LinuxArch for AArch64 {
                 )
             }
             VmImage::Kernel(ref mut kernel_image) => {
-                let loaded_kernel = load_kernel(&mem, payload_address, kernel_image)?;
+                let loaded_kernel = load_kernel(&mem, payload_address, kernel_image, memory_base)?;
                 let kernel_end = loaded_kernel.address_range.end;
                 let mut payload_end = GuestAddress(kernel_end);
                 initrd = match components.initrd_image {
@@ -628,7 +711,7 @@ impl arch::LinuxArch for AArch64 {
                         let initrd_addr = (kernel_end + 1 + (AARCH64_INITRD_ALIGN - 1))
                             & !(AARCH64_INITRD_ALIGN - 1);
                         let initrd_max_size =
-                            main_memory_size.saturating_sub(initrd_addr - AARCH64_PHYS_MEM_START);
+                            main_memory_size.saturating_sub(initrd_addr - memory_base);
                         let initrd_addr = GuestAddress(initrd_addr);
                         let initrd_size =
                             arch::load_image(&mem, &mut initrd_file, initrd_addr, initrd_max_size)
@@ -645,10 +728,10 @@ impl arch::LinuxArch for AArch64 {
             }
         };
 
-        let memory_end = GuestAddress(AARCH64_PHYS_MEM_START + main_memory_size);
+        let memory_end = GuestAddress(memory_base + main_memory_size);
 
         let fdt_address = match fdt_position {
-            FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START),
+            FdtPosition::Start => GuestAddress(memory_base),
             FdtPosition::End => {
                 let addr = memory_end
                     .checked_sub(AARCH64_FDT_MAX_SIZE)
@@ -749,6 +832,47 @@ impl arch::LinuxArch for AArch64 {
         }
 
         let mmio_bus = Arc::new(devices::Bus::new(BusType::Mmio));
+
+        #[cfg(target_os = "linux")]
+        let nvidia_dce_irq = if let Some(host_device) = components.nvidia_dce_host.take() {
+            let event_memory = SharedMemory::new("nvidia-dce-event", NVIDIA_DCE_EVENT_PAYLOAD_SIZE)
+                .map_err(Error::BuildNvidiaDcePayload)?;
+            let device_mapping = MemoryMappingBuilder::new(NVIDIA_DCE_EVENT_PAYLOAD_SIZE as usize)
+                .from_shared_memory(&event_memory)
+                .build()
+                .map_err(Error::MapNvidiaDcePayload)?;
+            let guest_mapping = MemoryMappingBuilder::new(NVIDIA_DCE_EVENT_PAYLOAD_SIZE as usize)
+                .from_shared_memory(&event_memory)
+                .build()
+                .map_err(Error::MapNvidiaDcePayload)?;
+            vm.add_memory_region(
+                GuestAddress(NVIDIA_DCE_EVENT_PAYLOAD_BASE),
+                Box::new(guest_mapping),
+                false,
+                false,
+                MemCacheType::CacheCoherent,
+            )
+            .map_err(Error::AddNvidiaDcePayload)?;
+
+            let irq = system_allocator.allocate_irq().ok_or(Error::AllocateIrq)?;
+            let irq_event = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
+            let device_irq = irq_event.try_clone().map_err(Error::CloneEvent)?;
+            let dce = NvidiaDceHost::new(host_device, device_mapping, device_irq)
+                .map_err(Error::CreateNvidiaDce)?;
+            irq_chip
+                .register_level_irq_event(irq, &irq_event, IrqEventSource::from_device(&dce))
+                .map_err(Error::RegisterIrqfd)?;
+            let dce = Arc::new(Mutex::new(dce));
+            mmio_bus
+                .insert(dce.clone(), NVIDIA_DCE_MMIO_BASE, NVIDIA_DCE_MMIO_SIZE)
+                .map_err(Error::RegisterNvidiaDce)?;
+            dce.lock()
+                .start_event_thread()
+                .map_err(Error::StartNvidiaDce)?;
+            Some(irq)
+        } else {
+            None
+        };
 
         #[cfg(target_os = "linux")]
         let has_nvidia_bpmp = components.nvidia_bpmp_host.is_some();
@@ -1083,7 +1207,12 @@ impl arch::LinuxArch for AArch64 {
             psci_version,
             components.swiotlb.map(|size| {
                 (
-                    get_swiotlb_addr(components.memory_size, size, vm.get_hypervisor()),
+                    get_swiotlb_addr(
+                        memory_base,
+                        components.memory_size,
+                        size,
+                        vm.get_hypervisor(),
+                    ),
                     size,
                 )
             }),
@@ -1097,6 +1226,8 @@ impl arch::LinuxArch for AArch64 {
             enable_nested,
             #[cfg(target_os = "linux")]
             has_nvidia_bpmp,
+            #[cfg(target_os = "linux")]
+            nvidia_dce_irq,
         )
         .map_err(Error::CreateFdt)?;
 

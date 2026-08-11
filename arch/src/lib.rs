@@ -512,6 +512,7 @@ pub struct VmComponents {
     pub hv_cfg: hypervisor::Config,
     pub initrd_image: Option<File>,
     pub itmt: bool,
+    pub memory_base: Option<u64>,
     pub memory_size: u64,
     #[cfg(target_arch = "aarch64")]
     pub nested: hypervisor::NestedMode,
@@ -520,10 +521,13 @@ pub struct VmComponents {
     pub no_smt: bool,
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     pub nvidia_bpmp_host: Option<File>,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub nvidia_dce_host: Option<File>,
 
     pub pci_config: PciConfig,
     pub pflash_block_size: u32,
     pub pflash_image: Option<File>,
+    pub platform_mmio: Option<MemoryRegionConfig>,
     pub pstore: Option<Pstore>,
     /// A file to load as pVM firmware. Must be `Some` iff
     /// `hv_cfg.protection_type == ProtectionType::UnprotectedWithFirmware`.
@@ -833,6 +837,9 @@ pub enum DeviceRegistrationError {
     /// No more IRQs are available.
     #[error("no more IRQs are available")]
     IrqsExhausted,
+    /// Failed to map VFIO platform memory before starting the guest.
+    #[error("failed to map VFIO platform memory: {0}")]
+    MapVfioPlatformMemory(anyhow::Error),
     /// VFIO device is missing a DT symbol.
     #[error("cannot match VFIO device to DT node due to a missing symbol")]
     MissingDeviceTreeSymbol,

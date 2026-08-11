@@ -102,6 +102,7 @@ use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::MemOptions;
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use crate::crosvm::config::NestedConfig;
+use crate::crosvm::config::PlatformMmioOptions;
 #[cfg(target_arch = "aarch64")]
 use crate::crosvm::config::ToggleMode;
 use crate::crosvm::config::TouchDeviceOption;
@@ -1424,6 +1425,7 @@ pub struct RunCommand {
     /// memory parameters.
     /// Possible key values:
     ///     size=NUM - amount of guest memory in MiB. (default: 256)
+    ///     base=ADDRESS - guest physical base address of RAM (AArch64 only)
     pub mem: Option<MemOptions>,
 
     #[allow(dead_code)] // Unused. Consider deleting it + the Config field of the same name.
@@ -1576,6 +1578,11 @@ pub struct RunCommand {
     /// forward guest BPMP requests to an NVIDIA host proxy character device.
     pub nvidia_bpmp_host: Option<PathBuf>,
 
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[argh(option, arg_name = "PATH")]
+    /// forward guest DCE requests and events to an NVIDIA host proxy character device.
+    pub nvidia_dce_host: Option<PathBuf>,
+
     #[cfg(target_arch = "x86_64")]
     #[argh(option, arg_name = "OEM_STRING")]
     /// (DEPRECATED): Use --smbios.
@@ -1633,6 +1640,10 @@ pub struct RunCommand {
     #[argh(option, arg_name = "PATH")]
     /// path to empty directory to use for sandbox pivot root
     pub pivot_root: Option<PathBuf>,
+
+    #[argh(option, arg_name = "base=ADDRESS,size=SIZE")]
+    /// explicit platform MMIO aperture (AArch64 only).
+    pub platform_mmio: Option<PlatformMmioOptions>,
 
     #[argh(option)]
     /// parameters for setting up a virtio-pmem device.
@@ -2138,7 +2149,7 @@ pub struct RunCommand {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[argh(
         option,
-        arg_name = "PATH[,guest-address=<BUS:DEVICE.FUNCTION>][,iommu=viommu|coiommu|pkvm-iommu|off][,dt-symbol=<SYMBOL>]"
+        arg_name = "PATH[,guest-address=<BUS:DEVICE.FUNCTION>][,iommu=viommu|coiommu|pkvm-iommu|off][,dt-symbol=<SYMBOL>][,mmio-base=<ADDRESS>][,map-early=<BOOL>]"
     )]
     /// path to sysfs of VFIO device.
     ///     guest-address=<BUS:DEVICE.FUNCTION> - PCI address
@@ -2150,6 +2161,9 @@ pub struct RunCommand {
     ///        to use for this device.
     ///     dt-symbol=<SYMBOL> - the symbol that labels the device tree
     ///        node in the device tree overlay file.
+    ///     mmio-base=<ADDRESS> - exact guest physical address for a
+    ///        single-region platform device.
+    ///     map-early=<BOOL> - map platform memory before guest execution.
     pub vfio: Vec<VfioOption>,
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -2347,6 +2361,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         {
             cfg.nvidia_bpmp_host = cmd.nvidia_bpmp_host;
+            cfg.nvidia_dce_host = cmd.nvidia_dce_host;
         }
 
         cfg.params.extend(cmd.params);
@@ -2453,6 +2468,8 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         let mem = cmd.mem.unwrap_or_default();
         cfg.memory = mem.size;
+        cfg.memory_base = mem.base;
+        cfg.platform_mmio = cmd.platform_mmio;
 
         #[cfg(target_arch = "aarch64")]
         {

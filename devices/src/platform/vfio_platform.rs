@@ -20,6 +20,7 @@ use base::Protection;
 use base::RawDescriptor;
 use hypervisor::MemCacheType;
 use hypervisor::Vm;
+use resources::AddressRange;
 use resources::SystemAllocator;
 use vfio_sys::*;
 use vm_control::api::VmMemoryClient;
@@ -46,12 +47,32 @@ struct MmioInfo {
     length: u64,
 }
 
+fn platform_region_alignment(size: u64) -> Result<u64, resources::Error> {
+    size.checked_next_power_of_two()
+        .ok_or(resources::Error::OutOfSpace)
+        .map(|alignment| alignment.max(pagesize() as u64))
+}
+
+fn validate_required_early_mapping(
+    map_early: bool,
+    flags: u32,
+    index: usize,
+    start: u64,
+) -> Result<()> {
+    if map_early && flags & VFIO_REGION_INFO_FLAG_MMAP == 0 {
+        bail!("VFIO region {index} at {start:#x} does not support the required early mapping");
+    }
+    Ok(())
+}
+
 pub struct VfioPlatformDevice {
     device: Arc<VfioDevice>,
     interrupt_edge_evt: Vec<IrqEdgeEvent>,
     interrupt_level_evt: Vec<IrqLevelEvent>,
     mmio_regions: Vec<MmioInfo>,
     vm_memory_client: VmMemoryClient,
+    mmio_base: Option<u64>,
+    map_early: bool,
     // scratch MemoryMapping to avoid unmap beform vm exit
     mem: Vec<MemoryMapping>,
 }
@@ -104,7 +125,12 @@ impl BusDeviceObj for VfioPlatformDevice {
 
 impl VfioPlatformDevice {
     /// Constructs a new Vfio Platform device for the given Vfio device
-    pub fn new(device: VfioDevice, vm_memory_client: VmMemoryClient) -> Self {
+    pub fn new(
+        device: VfioDevice,
+        vm_memory_client: VmMemoryClient,
+        mmio_base: Option<u64>,
+        map_early: bool,
+    ) -> Self {
         let dev = Arc::new(device);
         VfioPlatformDevice {
             device: dev,
@@ -112,6 +138,8 @@ impl VfioPlatformDevice {
             interrupt_level_evt: Vec::new(),
             mmio_regions: Vec::new(),
             vm_memory_client,
+            mmio_base,
+            map_early,
             mem: Vec::new(),
         }
     }
@@ -174,6 +202,10 @@ impl VfioPlatformDevice {
         &mut self,
         resources: &mut SystemAllocator,
     ) -> Result<Vec<(u64, u64)>, resources::Error> {
+        if self.mmio_base.is_some() && self.device.get_region_count() != 1 {
+            return Err(resources::Error::OutOfBounds);
+        }
+
         let mut ranges = Vec::new();
         for i in 0..self.device.get_region_count() {
             let size = self.device.get_region_size(i);
@@ -181,12 +213,18 @@ impl VfioPlatformDevice {
             let allocator = resources
                 .mmio_platform_allocator()
                 .ok_or(resources::Error::MissingPlatformMMIOAddresses)?;
-            let start_addr = allocator.allocate_with_align(
-                size,
-                alloc_id,
-                "vfio_mmio".to_string(),
-                pagesize() as u64,
-            )?;
+            let start_addr = if let Some(base) = self.mmio_base {
+                if base % pagesize() as u64 != 0 {
+                    return Err(resources::Error::BadAlignment);
+                }
+                let range = AddressRange::from_start_and_size(base, size)
+                    .ok_or(resources::Error::PoolOverflow { base, size })?;
+                allocator.allocate_at(range, alloc_id, "vfio_mmio".to_string())?;
+                base
+            } else {
+                let alignment = platform_region_alignment(size)?;
+                allocator.allocate_with_align(size, alloc_id, "vfio_mmio".to_string(), alignment)?
+            };
             ranges.push((start_addr, size));
 
             self.mmio_regions.push(MmioInfo {
@@ -198,9 +236,9 @@ impl VfioPlatformDevice {
         Ok(ranges)
     }
 
-    fn region_mmap_early(&self, vm: &dyn Vm, index: usize, start_addr: u64) {
+    fn region_mmap_early(&self, vm: &dyn Vm, index: usize, start_addr: u64) -> Result<()> {
         if self.device.get_region_flags(index) & VFIO_REGION_INFO_FLAG_MMAP == 0 {
-            return;
+            return Ok(());
         }
 
         for mmap in &self.device.get_region_mmap(index) {
@@ -210,31 +248,30 @@ impl VfioPlatformDevice {
             let region_offset = self.device.get_region_offset(index);
             let offset = region_offset + mmap_offset;
 
-            let mmap = match MemoryMappingBuilder::new(mmap_size as usize)
+            let mmap = MemoryMappingBuilder::new(mmap_size as usize)
                 .from_file(self.device.device_file())
                 .offset(offset)
                 .build()
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("{e}, index: {index}, start_addr:{start_addr:#x}, offset:{offset:#x}");
-                    break;
-                }
-            };
+                .with_context(|| {
+                    format!(
+                        "failed to map VFIO region {index} at {start_addr:#x}, offset {offset:#x}"
+                    )
+                })?;
 
             let host = mmap.as_ptr();
             let guest_addr = GuestAddress(guest_map_start);
-            if let Err(e) = vm.add_memory_region(
+            vm.add_memory_region(
                 guest_addr,
                 Box::new(mmap),
                 false,
                 false,
                 MemCacheType::CacheCoherent,
-            ) {
-                error!("{e}, index: {index}, guest_addr:{guest_addr}, host:{host:?}");
-                break;
-            }
+            )
+            .with_context(|| {
+                format!("failed to add VFIO region {index} at {guest_addr}, host {host:?}")
+            })?;
         }
+        Ok(())
     }
 
     /// Force adding the MMIO regions to the guest memory space.
@@ -242,10 +279,21 @@ impl VfioPlatformDevice {
     /// By default, MMIO regions are mapped lazily when the guest first accesses them. Instead,
     /// this function maps them, even if the guest might end up not accessing them. It only runs in
     /// the current thread and can therefore be called before the VM is started.
-    pub fn regions_mmap_early(&mut self, vm: &dyn Vm) {
+    pub fn regions_mmap_early(&mut self, vm: &dyn Vm) -> Result<()> {
         for mmio_info in self.mmio_regions.iter() {
-            self.region_mmap_early(vm, mmio_info.index, mmio_info.start);
+            validate_required_early_mapping(
+                self.map_early,
+                self.device.get_region_flags(mmio_info.index),
+                mmio_info.index,
+                mmio_info.start,
+            )?;
+            self.region_mmap_early(vm, mmio_info.index, mmio_info.start)?;
         }
+        Ok(())
+    }
+
+    pub fn map_early(&self) -> bool {
+        self.map_early
     }
 
     fn region_mmap(&self, index: usize, start_addr: u64) -> Vec<MemoryMapping> {
@@ -382,5 +430,112 @@ impl VfioPlatformDevice {
     /// its master IDs.
     pub fn iommu(&self) -> Option<(IommuDevType, Option<u32>, &[u32])> {
         self.device.iommu()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use resources::address_allocator::AddressAllocator;
+    use resources::Alloc;
+
+    use super::*;
+
+    #[test]
+    fn natural_alignment_matches_qemu_gpu_layout() {
+        let mut allocator = AddressAllocator::new(
+            AddressRange {
+                start: 0x6000_0000,
+                end: 0x67ff_ffff,
+            },
+            Some(0x1000),
+            None,
+        )
+        .unwrap();
+        allocator
+            .allocate_at(
+                AddressRange {
+                    start: 0x6000_0000,
+                    end: 0x63ff_ffff,
+                },
+                Alloc::Anon(0),
+                "vm_hs".to_string(),
+            )
+            .unwrap();
+
+        let sizes = [
+            0x0100_0000,
+            0x0100_0000,
+            0x0001_0000,
+            0x0001_0000,
+            0x0001_0000,
+            0x0001_0000,
+            0x0008_0000,
+            0x0004_0000,
+            0x0004_0000,
+            0x0004_0000,
+        ];
+        let addresses: Vec<u64> = sizes
+            .into_iter()
+            .enumerate()
+            .map(|(index, size)| {
+                allocator
+                    .allocate_with_align(
+                        size,
+                        Alloc::Anon(index + 1),
+                        "vfio_mmio".to_string(),
+                        platform_region_alignment(size).unwrap(),
+                    )
+                    .unwrap()
+            })
+            .collect();
+
+        assert_eq!(
+            addresses,
+            [
+                0x6400_0000,
+                0x6500_0000,
+                0x6600_0000,
+                0x6601_0000,
+                0x6602_0000,
+                0x6603_0000,
+                0x6608_0000,
+                0x6604_0000,
+                0x6610_0000,
+                0x6614_0000,
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_mapping_rejects_collisions() {
+        let mut allocator = AddressAllocator::new(
+            AddressRange {
+                start: 0x6000_0000,
+                end: 0x6fff_ffff,
+            },
+            Some(0x1000),
+            None,
+        )
+        .unwrap();
+        let fixed = AddressRange {
+            start: 0x6623_0000,
+            end: 0x6623_ffff,
+        };
+        allocator
+            .allocate_at(fixed, Alloc::Anon(0), "display".to_string())
+            .unwrap();
+        assert!(allocator
+            .allocate_at(fixed, Alloc::Anon(1), "collision".to_string())
+            .is_err());
+    }
+
+    #[test]
+    fn required_early_mapping_rejects_non_mappable_region() {
+        assert!(validate_required_early_mapping(true, 0, 2, 0x6000_0000).is_err());
+        assert!(validate_required_early_mapping(false, 0, 2, 0x6000_0000).is_ok());
+        assert!(
+            validate_required_early_mapping(true, VFIO_REGION_INFO_FLAG_MMAP, 2, 0x6000_0000,)
+                .is_ok()
+        );
     }
 }

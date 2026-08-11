@@ -1054,6 +1054,8 @@ fn create_devices(
                 Some(&mut coiommu_attached_endpoints),
                 vfio_dev.iommu,
                 vfio_dev.dt_symbol.clone(),
+                vfio_dev.mmio_base,
+                vfio_dev.map_early,
                 vfio_container_manager,
             )?;
             match dev {
@@ -1732,6 +1734,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     Ok(VmComponents {
         #[cfg(target_arch = "x86_64")]
         break_linux_pci_config_io: cfg.break_linux_pci_config_io,
+        memory_base: cfg.memory_base,
         memory_size: cfg
             .memory
             .unwrap_or(256)
@@ -1767,6 +1770,13 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         pstore: cfg.pstore.clone(),
         pflash_block_size,
         pflash_image,
+        platform_mmio: cfg
+            .platform_mmio
+            .as_ref()
+            .map(|region| arch::MemoryRegionConfig {
+                start: region.base,
+                size: Some(region.size),
+            }),
         initrd_image,
         extra_kernel_params: cfg.params.clone(),
         acpi_sdts: cfg
@@ -1806,6 +1816,17 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
                 open_file_or_duplicate(path, OpenOptions::new().read(true).write(true))
                     .with_context(|| {
                         format!("failed to open NVIDIA BPMP host device {}", path.display())
+                    })
+            })
+            .transpose()?,
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        nvidia_dce_host: cfg
+            .nvidia_dce_host
+            .as_ref()
+            .map(|path| {
+                open_file_or_duplicate(path, OpenOptions::new().read(true).write(true))
+                    .with_context(|| {
+                        format!("failed to open NVIDIA DCE host device {}", path.display())
                     })
             })
             .transpose()?,
@@ -3134,6 +3155,8 @@ fn add_hotplug_device(
                         IommuDevType::NoIommu
                     },
                     None,
+                    None,
+                    false,
                     vfio_container_manager,
                 )?;
                 let vfio_pci_device = match vfio_device {
