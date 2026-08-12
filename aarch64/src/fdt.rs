@@ -336,10 +336,6 @@ fn create_chosen_node(
 }
 
 fn create_config_node(fdt: &mut Fdt, kernel_region: AddressRange) -> Result<()> {
-    let addr: u32 = kernel_region
-        .start
-        .try_into()
-        .map_err(|_| Error::PropertyValueTooLarge)?;
     let size: u32 = kernel_region
         .len()
         .expect("invalid kernel_region")
@@ -347,7 +343,11 @@ fn create_config_node(fdt: &mut Fdt, kernel_region: AddressRange) -> Result<()> 
         .map_err(|_| Error::PropertyValueTooLarge)?;
 
     let config_node = fdt.root_mut().subnode_mut("config")?;
-    config_node.set_prop("kernel-address", addr)?;
+    if let Ok(addr) = u32::try_from(kernel_region.start) {
+        config_node.set_prop("kernel-address", addr)?;
+    } else {
+        config_node.set_prop("kernel-address", kernel_region.start)?;
+    }
     config_node.set_prop("kernel-size", size)?;
     Ok(())
 }
@@ -903,6 +903,34 @@ mod tests {
             psci_compatible(&PsciVersion::new(1, 0).unwrap()),
             vec!["arm,psci-1.0", "arm,psci-0.2"]
         );
+    }
+
+    #[test]
+    fn config_node_supports_high_kernel_address() {
+        let mut fdt = Fdt::new(&[]);
+        let kernel_region = AddressRange::from_start_and_size(0x20_0000_0000, 0x1000).unwrap();
+        create_config_node(&mut fdt, kernel_region).unwrap();
+
+        let config = fdt.get_node("/config").unwrap();
+        assert_eq!(
+            config.get_prop::<u64>("kernel-address").unwrap(),
+            0x20_0000_0000
+        );
+        assert_eq!(config.get_prop::<u32>("kernel-size").unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn config_node_preserves_32_bit_kernel_address() {
+        let mut fdt = Fdt::new(&[]);
+        let kernel_region = AddressRange::from_start_and_size(0x8000_0000, 0x1000).unwrap();
+        create_config_node(&mut fdt, kernel_region).unwrap();
+
+        let config = fdt.get_node("/config").unwrap();
+        assert_eq!(
+            config.get_prop::<u32>("kernel-address").unwrap(),
+            0x8000_0000
+        );
+        assert_eq!(config.get_prop::<u64>("kernel-address"), None);
     }
 
     #[test]
