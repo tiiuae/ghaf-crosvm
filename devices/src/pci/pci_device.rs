@@ -368,6 +368,14 @@ pub trait PciDevice: Send + Suspendable {
     /// Returns the configuration of a base address register, if present.
     fn get_bar_configuration(&self, bar_num: usize) -> Option<PciBarConfiguration>;
 
+    /// Finds the memory region containing an access specified by `address` and `size`.
+    ///
+    /// The default implementation searches the standard PCI BARs. Devices that expose additional
+    /// MMIO regions with non-BAR indices may override this method to include those regions.
+    fn find_bar_and_offset(&self, address: u64, size: usize) -> Option<(PciBarIndex, u64)> {
+        find_bar_and_offset(self, address, size)
+    }
+
     /// Register any capabilties specified by the device.
     fn register_device_capabilities(&mut self) -> Result<()> {
         Ok(())
@@ -555,7 +563,7 @@ fn trace_data(data: &[u8], offset: u64) -> u32 {
 /// is ever added, address space information will need to be added to `BusDevice::read()` and
 /// `BusDevice::write()` and passed along to this function.
 fn find_bar_and_offset(
-    device: &impl PciDevice,
+    device: &(impl PciDevice + ?Sized),
     address: u64,
     size: usize,
 ) -> Option<(PciBarIndex, u64)> {
@@ -605,7 +613,7 @@ impl<T: PciDevice> BusDevice for T {
     }
 
     fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
-        if let Some((bar_index, offset)) = find_bar_and_offset(self, info.address, data.len()) {
+        if let Some((bar_index, offset)) = self.find_bar_and_offset(info.address, data.len()) {
             self.read_bar(bar_index, offset, data);
         } else {
             error!("PciDevice::read({:#x}) did not match a BAR", info.address);
@@ -613,7 +621,7 @@ impl<T: PciDevice> BusDevice for T {
     }
 
     fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
-        if let Some((bar_index, offset)) = find_bar_and_offset(self, info.address, data.len()) {
+        if let Some((bar_index, offset)) = self.find_bar_and_offset(info.address, data.len()) {
             self.write_bar(bar_index, offset, data);
         } else {
             error!("PciDevice::write({:#x}) did not match a BAR", info.address);
@@ -782,6 +790,9 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     }
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
         (**self).write_config_register(reg_idx, offset, data)
+    }
+    fn find_bar_and_offset(&self, address: u64, size: usize) -> Option<(PciBarIndex, u64)> {
+        (**self).find_bar_and_offset(address, size)
     }
     fn setup_pci_config_mapping(
         &mut self,

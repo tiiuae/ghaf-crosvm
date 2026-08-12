@@ -103,6 +103,22 @@ fn vfio_region_is_backed(size: u64) -> bool {
     size != 0
 }
 
+fn find_mmio_region(
+    regions: &[PciBarConfiguration],
+    address: u64,
+    size: usize,
+) -> Option<(PciBarIndex, u64)> {
+    if size == 0 {
+        return None;
+    }
+
+    regions.iter().find_map(|region| {
+        let offset = address.checked_sub(region.address())?;
+        let max_offset = region.size().checked_sub(size as u64)?;
+        (offset <= max_offset).then_some((region.bar_index(), offset))
+    })
+}
+
 // Size of the standard PCI config space
 const PCI_CONFIG_SPACE_SIZE: u32 = 0x100;
 // Size of the standard PCIe config space: 4KB
@@ -1813,6 +1829,14 @@ impl PciDevice for VfioPciDevice {
         None
     }
 
+    fn find_bar_and_offset(&self, address: u64, size: usize) -> Option<(PciBarIndex, u64)> {
+        if size == 0 || self.config.read_config::<u8>(PCI_COMMAND) & PCI_COMMAND_MEMORY == 0 {
+            return None;
+        }
+
+        find_mmio_region(&self.mmio_regions, address, size)
+    }
+
     fn register_device_capabilities(&mut self) -> Result<(), PciDeviceError> {
         Ok(())
     }
@@ -2154,13 +2178,55 @@ impl Suspendable for VfioPciDevice {
 mod tests {
     use resources::AddressRange;
 
+    use super::find_mmio_region;
     use super::vfio_region_is_backed;
+    use super::PciBarConfiguration;
+    use super::PciBarIndex;
+    use super::PciBarPrefetchable;
+    use super::PciBarRegionType;
     use super::VfioResourceAllocator;
 
     #[test]
     fn zero_size_vfio_region_is_not_backed() {
         assert!(!vfio_region_is_backed(0));
         assert!(vfio_region_is_backed(1));
+    }
+
+    #[test]
+    fn finds_vendor_mmio_region_outside_standard_bar_indices() {
+        const OPREGION_INDEX: PciBarIndex = 9;
+        const OPREGION_ADDR: u64 = 0xd000_0000;
+        const OPREGION_SIZE: u64 = 0x2000;
+
+        let regions = [
+            PciBarConfiguration::new(
+                0,
+                0x1000,
+                PciBarRegionType::Memory32BitRegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(0xc000_0000),
+            PciBarConfiguration::new(
+                OPREGION_INDEX,
+                OPREGION_SIZE,
+                PciBarRegionType::Memory32BitRegion,
+                PciBarPrefetchable::NotPrefetchable,
+            )
+            .set_address(OPREGION_ADDR),
+        ];
+
+        assert_eq!(
+            find_mmio_region(&regions, OPREGION_ADDR, 8),
+            Some((OPREGION_INDEX, 0))
+        );
+        assert_eq!(
+            find_mmio_region(&regions, OPREGION_ADDR + 0x10, 8),
+            Some((OPREGION_INDEX, 0x10))
+        );
+        assert_eq!(
+            find_mmio_region(&regions, OPREGION_ADDR + OPREGION_SIZE - 7, 8),
+            None
+        );
     }
 
     #[test]
