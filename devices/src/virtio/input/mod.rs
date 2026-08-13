@@ -127,7 +127,7 @@ pub struct virtio_input_device_ids {
 }
 
 impl virtio_input_device_ids {
-    fn new(bustype: u16, product: u16, vendor: u16, version: u16) -> virtio_input_device_ids {
+    fn new(bustype: u16, vendor: u16, product: u16, version: u16) -> virtio_input_device_ids {
         virtio_input_device_ids {
             bustype: Le16::from(bustype),
             vendor: Le16::from(vendor),
@@ -156,6 +156,7 @@ pub struct virtio_input_absinfo {
     max: Le32,
     fuzz: Le32,
     flat: Le32,
+    res: Le32,
 }
 
 impl virtio_input_absinfo {
@@ -165,6 +166,7 @@ impl virtio_input_absinfo {
             max: Le32::from(max),
             fuzz: Le32::from(fuzz),
             flat: Le32::from(flat),
+            res: Le32::from(0),
         }
     }
 }

@@ -96,6 +96,7 @@ impl From<evdev_abs_info> for virtio_input_absinfo {
             max: Le32::from(other.maximum),
             fuzz: Le32::from(other.fuzz),
             flat: Le32::from(other.flat),
+            res: Le32::from(other.resolution),
         }
     }
 }
@@ -288,7 +289,38 @@ pub fn ungrab_evdev<T: AsRawDescriptor>(descriptor: &mut T) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use data_model::Le16;
+
     use super::*;
+
+    #[test]
+    fn device_ids_preserve_vendor_and_product() {
+        let ids = virtio_input_device_ids::new(0x01, 0x02, 0x03, 0x04);
+
+        assert_eq!(ids.bustype, Le16::from(0x01));
+        assert_eq!(ids.vendor, Le16::from(0x02));
+        assert_eq!(ids.product, Le16::from(0x03));
+        assert_eq!(ids.version, Le16::from(0x04));
+    }
+
+    #[test]
+    fn abs_info_preserves_resolution() {
+        let abs_info = virtio_input_absinfo::from(evdev_abs_info {
+            value: 1,
+            minimum: 2,
+            maximum: 3,
+            fuzz: 4,
+            flat: 5,
+            resolution: 6,
+        });
+
+        assert_eq!(abs_info.min, Le32::from(2));
+        assert_eq!(abs_info.max, Le32::from(3));
+        assert_eq!(abs_info.fuzz, Le32::from(4));
+        assert_eq!(abs_info.flat, Le32::from(5));
+        assert_eq!(abs_info.res, Le32::from(6));
+        assert_eq!(std::mem::size_of_val(&abs_info), 20);
+    }
 
     #[test]
     fn missing_serial_name_is_empty() {
