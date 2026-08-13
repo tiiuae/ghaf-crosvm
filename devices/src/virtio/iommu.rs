@@ -10,6 +10,7 @@ pub(crate) mod sys;
 use std::cell::RefCell;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io;
 use std::io::Write;
 use std::mem::size_of;
@@ -187,6 +188,8 @@ struct State {
     // key: endpoint PCI address
     // value: reference counter and MemoryMapperTrait
     endpoints: BTreeMap<u32, Arc<Mutex<Box<dyn MemoryMapperTrait>>>>,
+    // Endpoints whose host-initiated PCI removal is waiting for guest teardown.
+    pending_endpoint_removals: BTreeSet<u32>,
     // Contains dmabuf regions
     // key: guest physical address
     dmabuf_mem: BTreeMap<u64, DmabufRegionEntry>,
@@ -200,30 +203,45 @@ impl State {
     // The device MUST ensure that after being detached from a domain, the endpoint
     // cannot access any mapping from that domain.
     //
-    // Currently, we only support detaching an endpoint if it is the only endpoint attached
-    // to its domain.
+    // A mapper that does not support arbitrary guest-initiated detach may still be detached when
+    // Crosvm is already removing its PCI endpoint. Endpoints backed by the same VFIO group share a
+    // mapper and therefore a domain. In that removal path, keep the mapper active for the remaining
+    // endpoints and drop the domain when the final endpoint leaves.
     fn detach_endpoint(
         endpoint_map: &mut BTreeMap<u32, u32>,
         domain_map: &mut DomainMap,
         endpoint: u32,
+        endpoint_is_being_removed: bool,
     ) -> (bool, Option<EventAsync>) {
         let mut evt = None;
         // The endpoint has attached to an IOMMU domain
-        if let Some(attached_domain) = endpoint_map.get(&endpoint) {
+        if let Some(attached_domain) = endpoint_map.get(&endpoint).copied() {
             // Remove the entry or update the domain reference count
-            if let Entry::Occupied(o) = domain_map.entry(*attached_domain) {
-                let (refs, mapper) = o.get();
-                if !mapper.lock().supports_detach() {
-                    return (false, None);
-                }
-
-                match refs {
-                    0 => unreachable!(),
-                    1 => {
-                        evt = mapper.lock().reset_domain();
-                        o.remove();
+            if let Entry::Occupied(mut o) = domain_map.entry(attached_domain) {
+                let refs = o.get().0;
+                if endpoint_is_being_removed {
+                    match refs {
+                        0 => unreachable!(),
+                        1 => {
+                            o.remove();
+                        }
+                        _ => {
+                            o.get_mut().0 -= 1;
+                        }
                     }
-                    _ => return (false, None),
+                } else {
+                    let mapper = &o.get().1;
+                    if refs != 1 || !mapper.lock().supports_detach() {
+                        return (false, None);
+                    }
+                    match refs {
+                        0 => unreachable!(),
+                        1 => {
+                            evt = mapper.lock().reset_domain();
+                            o.remove();
+                        }
+                        _ => unreachable!(),
+                    }
                 }
             }
         }
@@ -306,8 +324,12 @@ impl State {
                 // a DETACH request with this endpoint, followed by the ATTACH
                 // request. If the device cannot do so, it MUST reject the request
                 // and set status to VIRTIO_IOMMU_S_UNSUPP.
-                let (detached, evt) =
-                    Self::detach_endpoint(&mut self.endpoint_map, &mut self.domain_map, endpoint);
+                let (detached, evt) = Self::detach_endpoint(
+                    &mut self.endpoint_map,
+                    &mut self.domain_map,
+                    endpoint,
+                    false,
+                );
                 if !detached {
                     tail.status = VIRTIO_IOMMU_S_UNSUPP;
                     return Ok((0, None));
@@ -349,8 +371,12 @@ impl State {
             return Ok((0, None));
         }
 
-        let (detached, evt) =
-            Self::detach_endpoint(&mut self.endpoint_map, &mut self.domain_map, endpoint);
+        let (detached, evt) = Self::detach_endpoint(
+            &mut self.endpoint_map,
+            &mut self.domain_map,
+            endpoint,
+            self.pending_endpoint_removals.contains(&endpoint),
+        );
         if !detached {
             tail.status = VIRTIO_IOMMU_S_UNSUPP;
         }
@@ -848,6 +874,7 @@ impl VirtioDevice for Iommu {
                 endpoint_map: BTreeMap::new(),
                 domain_map: BTreeMap::new(),
                 endpoints: eps,
+                pending_endpoint_removals: BTreeSet::new(),
                 dmabuf_mem: BTreeMap::new(),
             };
             let result = run(
@@ -931,5 +958,78 @@ impl VirtioDevice for Iommu {
 
         sdts.push(viot);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base::AsRawDescriptors;
+
+    use super::*;
+
+    struct NonDetachableMapper;
+
+    impl MemoryMapper for NonDetachableMapper {
+        fn add_map(&mut self, _: MappingInfo) -> anyhow::Result<AddMapResult> {
+            unreachable!()
+        }
+
+        fn remove_map(&mut self, _: u64, _: u64) -> anyhow::Result<RemoveMapResult> {
+            unreachable!()
+        }
+
+        fn get_mask(&self) -> anyhow::Result<u64> {
+            Ok(u64::MAX)
+        }
+
+        fn supports_detach(&self) -> bool {
+            false
+        }
+
+        fn id(&self) -> u32 {
+            1
+        }
+    }
+
+    impl AsRawDescriptors for NonDetachableMapper {
+        fn as_raw_descriptors(&self) -> Vec<RawDescriptor> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn detaches_endpoints_from_shared_domain_one_at_a_time() {
+        let mapper: Arc<Mutex<Box<dyn MemoryMapperTrait>>> =
+            Arc::new(Mutex::new(Box::new(NonDetachableMapper)));
+        let mut endpoint_map = BTreeMap::from([(0x100, 7), (0x101, 7)]);
+        let mut domain_map = BTreeMap::from([(7, (2, mapper))]);
+
+        let (detached, event) =
+            State::detach_endpoint(&mut endpoint_map, &mut domain_map, 0x100, false);
+        assert!(!detached);
+        assert!(event.is_none());
+        assert_eq!(endpoint_map.len(), 2);
+        assert_eq!(
+            domain_map.get(&7).map(|(references, _)| *references),
+            Some(2)
+        );
+
+        let (detached, event) =
+            State::detach_endpoint(&mut endpoint_map, &mut domain_map, 0x100, true);
+        assert!(detached);
+        assert!(event.is_none());
+        assert!(!endpoint_map.contains_key(&0x100));
+        assert_eq!(endpoint_map.get(&0x101), Some(&7));
+        assert_eq!(
+            domain_map.get(&7).map(|(references, _)| *references),
+            Some(1)
+        );
+
+        let (detached, event) =
+            State::detach_endpoint(&mut endpoint_map, &mut domain_map, 0x101, true);
+        assert!(detached);
+        assert!(event.is_none());
+        assert!(endpoint_map.is_empty());
+        assert!(domain_map.is_empty());
     }
 }

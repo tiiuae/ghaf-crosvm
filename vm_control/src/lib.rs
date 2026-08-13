@@ -2869,6 +2869,10 @@ pub enum VirtioIOMMUVfioCommand {
         #[serde(with = "with_as_descriptor")]
         container: File,
     },
+    // Allow the guest to detach an endpoint while Crosvm waits for PCI removal to complete.
+    VfioDevicePrepareDel {
+        endpoint_addr: u32,
+    },
     // Delete the vfio device attached to virtio-iommu.
     VfioDeviceDel {
         endpoint_addr: u32,
