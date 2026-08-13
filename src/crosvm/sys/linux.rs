@@ -3415,6 +3415,24 @@ fn remove_hotplug_device(
             .lock()
             .get_hotplug_device(hotplug_key)
             .context("removable VFIO device is already detached")?;
+        // VFIO cannot revoke one function's DMA mappings independently when several functions
+        // share an IOMMU group. Tell virtio-IOMMU that host-initiated removal is in progress so it
+        // can acknowledge the guest's per-function DETACH requests while keeping the shared mapper
+        // active until the last function has gone away.
+        if let Some(iommu_host_tube) = iommu_host_tube {
+            for group_pci_addr in &group_devices {
+                let request =
+                    VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDevicePrepareDel {
+                        endpoint_addr: group_pci_addr.to_u32(),
+                    });
+                match virtio_iommu_request(iommu_host_tube, &request)
+                    .map_err(|_| VirtioIOMMUVfioError::SocketFailed)?
+                {
+                    VirtioIOMMUResponse::VfioResponse(VirtioIOMMUVfioResult::Ok) => (),
+                    resp => bail!("Unexpected message response: {:?}", resp),
+                }
+            }
+        }
         let completion_event = hp_bus.lock().hot_unplug(pci_addr)?;
         if let Some(event) = completion_event {
             wait_for_hotplug_event(event, "PCI removal")?;

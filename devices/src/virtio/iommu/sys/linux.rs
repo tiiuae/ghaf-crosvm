@@ -50,8 +50,20 @@ impl State {
             return VirtioIOMMUVfioResult::NotInPCIRanges;
         }
 
+        self.pending_endpoint_removals.remove(&endpoint_addr);
         self.endpoints
             .insert(endpoint_addr, Arc::new(Mutex::new(Box::new(wrapper))));
+        VirtioIOMMUVfioResult::Ok
+    }
+
+    pub(in crate::virtio::iommu) fn handle_prepare_del_vfio_device(
+        &mut self,
+        endpoint_addr: u32,
+    ) -> VirtioIOMMUVfioResult {
+        if !self.endpoints.contains_key(&endpoint_addr) {
+            return VirtioIOMMUVfioResult::NoSuchDevice;
+        }
+        self.pending_endpoint_removals.insert(endpoint_addr);
         VirtioIOMMUVfioResult::Ok
     }
 
@@ -59,12 +71,16 @@ impl State {
         &mut self,
         pci_address: u32,
     ) -> VirtioIOMMUVfioResult {
+        State::detach_endpoint(
+            &mut self.endpoint_map,
+            &mut self.domain_map,
+            pci_address,
+            true,
+        );
+        self.pending_endpoint_removals.remove(&pci_address);
         if self.endpoints.remove(&pci_address).is_none() {
             error!("There is no vfio container of {}", pci_address);
             return VirtioIOMMUVfioResult::NoSuchDevice;
-        }
-        if let Some(domain) = self.endpoint_map.remove(&pci_address) {
-            self.domain_map.remove(&domain);
         }
         VirtioIOMMUVfioResult::Ok
     }
@@ -125,6 +141,9 @@ impl State {
     ) -> VirtioIOMMUResponse {
         use VirtioIOMMUVfioCommand::*;
         let vfio_result = match vfio_cmd {
+            VfioDevicePrepareDel { endpoint_addr } => {
+                self.handle_prepare_del_vfio_device(endpoint_addr)
+            }
             VfioDeviceAdd {
                 wrapper_id,
                 container,
