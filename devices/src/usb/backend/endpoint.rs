@@ -192,13 +192,6 @@ impl UsbEndpoint {
         xhci_transfer: XhciTransfer,
         buffer: ScatterGatherBuffer,
     ) -> Result<()> {
-        // We do not support OUT transfer yet.
-        if self.direction == EndpointDirection::HostToDevice {
-            return xhci_transfer
-                .on_transfer_complete(&TransferStatus::Error, 0)
-                .map_err(Error::TransferComplete);
-        }
-
         let max_payload = xhci_transfer
             .get_max_payload()
             .map_err(Error::TransferGetMaxPayload)?;

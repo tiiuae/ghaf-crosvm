@@ -839,6 +839,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_isochronous_out_transfer() {
+        const ENDPOINT_OUT: u8 = 0x01;
+        const PACKET_SIZE: u32 = 192;
+        let payload = vec![0x5a; PACKET_SIZE as usize * 2 + 1];
+        let transfer = Transfer::new_isochronous(
+            ENDPOINT_OUT,
+            TransferBuffer::Vector(payload.clone()),
+            PACKET_SIZE,
+        )
+        .unwrap();
+
+        assert_eq!(transfer.urb().urb_type, usb_sys::USBDEVFS_URB_TYPE_ISO);
+        assert_eq!(transfer.urb().endpoint, ENDPOINT_OUT);
+        assert_eq!(
+            transfer.urb().number_of_packets_or_stream_id,
+            3,
+            "the final byte requires a third isochronous packet"
+        );
+        assert_eq!(transfer.urb().flags, usb_sys::USBDEVFS_URB_ISO_ASAP);
+        assert!(matches!(
+            &transfer.buffer,
+            TransferBuffer::Vector(buffer) if buffer == &payload
+        ));
+
+        // SAFETY:
+        // Transfer::new_isochronous allocated the trailing array for exactly
+        // number_of_packets_or_stream_id packet descriptors.
+        let packets = unsafe { transfer.urb().iso_frame_desc.as_slice(3) };
+        assert_eq!(packets[0].length, PACKET_SIZE);
+        assert_eq!(packets[1].length, PACKET_SIZE);
+        assert_eq!(packets[2].length, 1);
+    }
+
+    #[test]
     fn test_reserve_dma_buffer_oob() {
         let dummy_fd = File::open("/dev/null").unwrap();
         let descriptor_data: &[u8] = &[
