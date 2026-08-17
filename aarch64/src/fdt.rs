@@ -28,6 +28,8 @@ use devices::IommuDevType;
 use devices::PciAddress;
 use devices::PciInterruptPin;
 use devices::PlatformBusResources;
+#[cfg(target_os = "linux")]
+use devices::NVIDIA_BPMP_MMIO_BASE;
 use hypervisor::PsciVersion;
 use hypervisor::PSCI_0_2;
 use hypervisor::PSCI_1_0;
@@ -61,6 +63,8 @@ use crate::AARCH64_VMWDT_IRQ;
 const PHANDLE_GIC: u32 = 1;
 const PHANDLE_GIC_ITS: u32 = 3;
 const PHANDLE_RESTRICTED_DMA_POOL: u32 = 2;
+#[cfg(target_os = "linux")]
+const PHANDLE_NVIDIA_BPMP: u32 = 4;
 
 // CPUs are assigned phandles starting with this number.
 const PHANDLE_CPU0: u32 = 0x100;
@@ -612,6 +616,19 @@ fn add_symbols_entry(fdt: &mut Fdt, symbol: &str, path: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn create_nvidia_bpmp_node(fdt: &mut Fdt) -> Result<()> {
+    let bpmp_node = fdt.root_mut().subnode_mut("bpmp")?;
+    bpmp_node.set_prop("compatible", "nvidia,tegra186-bpmp")?;
+    bpmp_node.set_prop("virtual-pa", NVIDIA_BPMP_MMIO_BASE)?;
+    bpmp_node.set_prop("#clock-cells", 1u32)?;
+    bpmp_node.set_prop("#reset-cells", 1u32)?;
+    bpmp_node.set_prop("#power-domain-cells", 1u32)?;
+    bpmp_node.set_prop("phandle", PHANDLE_NVIDIA_BPMP)?;
+    add_symbols_entry(fdt, "bpmp", "/bpmp")?;
+    Ok(())
+}
+
 /// Creates a flattened device tree containing all of the parameters for the
 /// kernel and loads it into the guest memory at the specified offset.
 ///
@@ -663,6 +680,7 @@ pub fn create_fdt(
     serial_devices: &[SerialDeviceInfo],
     virt_cpufreq_v2: bool,
     enable_nested: bool,
+    #[cfg(target_os = "linux")] nvidia_bpmp: bool,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -748,6 +766,11 @@ pub fn create_fdt(
     }
     create_vmwdt_node(&mut fdt, vmwdt_cfg, num_vcpus)?;
     create_kvm_cpufreq_node(&mut fdt)?;
+    #[cfg(target_os = "linux")]
+    if nvidia_bpmp {
+        create_nvidia_bpmp_node(&mut fdt)?;
+        phandles.insert("bpmp", PHANDLE_NVIDIA_BPMP);
+    }
     vm_generator(&mut fdt, &phandles)?;
     if vcpu_properties.values().any(|p| !p.frequencies.is_empty()) {
         if virt_cpufreq_v2 {
@@ -932,5 +955,27 @@ mod tests {
 
         let symbols = fdt.get_node("/__symbols__").unwrap();
         assert_eq!(symbols.get_prop::<String>(TEST_SYMBOL).unwrap(), TEST_PATH);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvidia_bpmp_node_exports_overlay_symbol() {
+        let mut fdt = Fdt::new(&[]);
+        create_nvidia_bpmp_node(&mut fdt).unwrap();
+
+        let bpmp = fdt.get_node("/bpmp").unwrap();
+        assert_eq!(
+            bpmp.get_prop::<String>("compatible").unwrap(),
+            "nvidia,tegra186-bpmp"
+        );
+        assert_eq!(
+            bpmp.get_prop::<u64>("virtual-pa").unwrap(),
+            NVIDIA_BPMP_MMIO_BASE
+        );
+        assert_eq!(
+            bpmp.get_prop::<u32>("phandle").unwrap(),
+            PHANDLE_NVIDIA_BPMP
+        );
+        assert_eq!(fdt.symbol_to_path("bpmp").unwrap().to_string(), "/bpmp");
     }
 }

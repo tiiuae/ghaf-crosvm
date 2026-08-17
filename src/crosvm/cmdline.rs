@@ -1571,6 +1571,11 @@ pub struct RunCommand {
     /// don't use usb devices in the guest
     pub no_usb: Option<bool>,
 
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[argh(option, arg_name = "PATH")]
+    /// forward guest BPMP requests to an NVIDIA host proxy character device.
+    pub nvidia_bpmp_host: Option<PathBuf>,
+
     #[cfg(target_arch = "x86_64")]
     #[argh(option, arg_name = "OEM_STRING")]
     /// (DEPRECATED): Use --smbios.
@@ -2337,6 +2342,11 @@ impl TryFrom<RunCommand> for super::config::Config {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
             cfg.nested = cmd.nested.unwrap_or_default();
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        {
+            cfg.nvidia_bpmp_host = cmd.nvidia_bpmp_host;
         }
 
         cfg.params.extend(cmd.params);

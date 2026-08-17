@@ -44,6 +44,7 @@ use std::mem;
 use std::ops::RangeInclusive;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use std::path::PathBuf;
 #[cfg(target_arch = "aarch64")]
 use std::process;
@@ -1797,6 +1798,17 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         sve_config: cfg.sve.unwrap_or_default(),
         #[cfg(target_arch = "aarch64")]
         nested: cfg.nested.mode,
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        nvidia_bpmp_host: cfg
+            .nvidia_bpmp_host
+            .as_ref()
+            .map(|path| {
+                open_file_or_duplicate(path, OpenOptions::new().read(true).write(true))
+                    .with_context(|| {
+                        format!("failed to open NVIDIA BPMP host device {}", path.display())
+                    })
+            })
+            .transpose()?,
     })
 }
 
@@ -5857,6 +5869,7 @@ pub fn setup_emulator_crash_reporting(_cfg: &Config) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    #[cfg(target_arch = "x86_64")]
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 

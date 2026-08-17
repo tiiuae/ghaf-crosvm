@@ -44,6 +44,8 @@ use devices::HvcDevicePowerManager;
 use devices::IrqChip;
 use devices::IrqChipAArch64;
 use devices::IrqEventSource;
+#[cfg(target_os = "linux")]
+use devices::NvidiaBpmpHost;
 use devices::PciAddress;
 use devices::PciConfigMmio;
 use devices::PciDevice;
@@ -54,6 +56,10 @@ use devices::SmcccTrng;
 use devices::VirtCpufreq;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use devices::VirtCpufreqV2;
+#[cfg(target_os = "linux")]
+use devices::NVIDIA_BPMP_MMIO_BASE;
+#[cfg(target_os = "linux")]
+use devices::NVIDIA_BPMP_MMIO_SIZE;
 use fdt::PciAddressSpace;
 #[cfg(feature = "gdb")]
 use gdbstub::arch::Arch;
@@ -337,6 +343,8 @@ pub enum Error {
     RegisterHypercalls(u64, usize, BusError),
     #[error("failed to register irq fd: {0}")]
     RegisterIrqfd(base::Error),
+    #[error("error registering NVIDIA BPMP host bridge: {0}")]
+    RegisterNvidiaBpmp(BusError),
     #[error("error registering PCI bus: {0}")]
     RegisterPci(BusError),
     #[error("error registering virtual cpufreq device: {0}")]
@@ -742,6 +750,19 @@ impl arch::LinuxArch for AArch64 {
 
         let mmio_bus = Arc::new(devices::Bus::new(BusType::Mmio));
 
+        #[cfg(target_os = "linux")]
+        let has_nvidia_bpmp = components.nvidia_bpmp_host.is_some();
+        #[cfg(target_os = "linux")]
+        if let Some(host_device) = components.nvidia_bpmp_host.take() {
+            mmio_bus
+                .insert(
+                    Arc::new(Mutex::new(NvidiaBpmpHost::new(host_device))),
+                    NVIDIA_BPMP_MMIO_BASE,
+                    NVIDIA_BPMP_MMIO_SIZE,
+                )
+                .map_err(Error::RegisterNvidiaBpmp)?;
+        }
+
         let hypercall_bus = Arc::new(devices::Bus::new(BusType::Hypercall));
 
         // ARM doesn't really use the io bus like x86, so just create an empty bus.
@@ -1074,6 +1095,8 @@ impl arch::LinuxArch for AArch64 {
             &serial_devices,
             components.virt_cpufreq_v2,
             enable_nested,
+            #[cfg(target_os = "linux")]
+            has_nvidia_bpmp,
         )
         .map_err(Error::CreateFdt)?;
 

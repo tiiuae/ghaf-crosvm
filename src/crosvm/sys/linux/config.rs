@@ -546,6 +546,23 @@ mod tests {
         assert_eq!(vfio.path, PathBuf::from("/path/to/dev"));
     }
 
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    fn nvidia_bpmp_host_path() {
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &["--nvidia-bpmp-host", "/dev/bpmp-host", "/dev/null"],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        assert_eq!(
+            config.nvidia_bpmp_host,
+            Some(PathBuf::from("/dev/bpmp-host"))
+        );
+    }
+
     #[test]
     fn hypervisor_default() {
         let config: Config = crate::crosvm::cmdline::RunCommand::from_args(&[], &["/dev/null"])

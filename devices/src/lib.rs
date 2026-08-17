@@ -20,6 +20,8 @@ mod i8042;
 mod irq_event;
 pub mod irqchip;
 mod mock;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+mod nvidia_bpmp;
 mod pci;
 mod pflash;
 pub mod pl030;
@@ -94,6 +96,12 @@ pub use self::irq_event::IrqEdgeEvent;
 pub use self::irq_event::IrqLevelEvent;
 pub use self::irqchip::*;
 pub use self::mock::MockDevice;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use self::nvidia_bpmp::NvidiaBpmpHost;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use self::nvidia_bpmp::NVIDIA_BPMP_MMIO_BASE;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use self::nvidia_bpmp::NVIDIA_BPMP_MMIO_SIZE;
 pub use self::pci::BarRange;
 pub use self::pci::GpeScope;
 #[cfg(feature = "pci-hotplug")]

@@ -724,6 +724,8 @@ pub struct Config {
     pub no_pmu: bool,
     pub no_rtc: bool,
     pub no_smt: bool,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    pub nvidia_bpmp_host: Option<PathBuf>,
     pub params: Vec<String>,
     pub pci_config: PciConfig,
     #[cfg(feature = "pci-hotplug")]
@@ -968,6 +970,8 @@ impl Default for Config {
             no_pmu: false,
             no_rtc: false,
             no_smt: false,
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            nvidia_bpmp_host: None,
             params: Vec::new(),
             pci_config: Default::default(),
             #[cfg(feature = "pci-hotplug")]

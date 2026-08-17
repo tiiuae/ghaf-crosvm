@@ -1253,10 +1253,9 @@ impl VfioDevice {
         // The ChromeOS VFIO ACPI ABI rejects buffers larger than one host page. Keep the ioctl
         // header and its variable payload within that limit; the AML transport is page-backed and
         // zero-padded, so truncating only removes unused tail bytes.
-        let count = args.len().min(
-            base::pagesize()
-                .saturating_sub(mem::size_of::<vfio_acpi_dsm>()),
-        );
+        let count = args
+            .len()
+            .min(base::pagesize().saturating_sub(mem::size_of::<vfio_acpi_dsm>()));
         let mut dsm = vec_with_array_field::<vfio_acpi_dsm, u8>(count);
         dsm[0].argsz = (mem::size_of::<vfio_acpi_dsm>() + count) as u32;
         dsm[0].padding = 0;
@@ -2025,11 +2024,12 @@ mod tests {
     use std::collections::HashMap;
     use std::fs::File;
 
+    use vfio_sys::VFIO_REGION_INFO_CAP_MSIX_MAPPABLE;
+    use vfio_sys::VFIO_REGION_INFO_CAP_SPARSE_MMAP;
+
     use super::region_cap_preserves_sparse_mmaps;
     use super::VfioContainer;
     use super::VfioError;
-    use vfio_sys::VFIO_REGION_INFO_CAP_MSIX_MAPPABLE;
-    use vfio_sys::VFIO_REGION_INFO_CAP_SPARSE_MMAP;
 
     #[test]
     fn unconfigured_container_rejects_dma_map_without_panicking() {
