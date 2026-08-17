@@ -30,6 +30,8 @@ use devices::PciInterruptPin;
 use devices::PlatformBusResources;
 #[cfg(target_os = "linux")]
 use devices::NVIDIA_BPMP_MMIO_BASE;
+#[cfg(target_os = "linux")]
+use devices::NVIDIA_DCE_MMIO_BASE;
 use hypervisor::PsciVersion;
 use hypervisor::PSCI_0_2;
 use hypervisor::PSCI_1_0;
@@ -334,10 +336,6 @@ fn create_chosen_node(
 }
 
 fn create_config_node(fdt: &mut Fdt, kernel_region: AddressRange) -> Result<()> {
-    let addr: u32 = kernel_region
-        .start
-        .try_into()
-        .map_err(|_| Error::PropertyValueTooLarge)?;
     let size: u32 = kernel_region
         .len()
         .expect("invalid kernel_region")
@@ -345,7 +343,11 @@ fn create_config_node(fdt: &mut Fdt, kernel_region: AddressRange) -> Result<()> 
         .map_err(|_| Error::PropertyValueTooLarge)?;
 
     let config_node = fdt.root_mut().subnode_mut("config")?;
-    config_node.set_prop("kernel-address", addr)?;
+    if let Ok(addr) = u32::try_from(kernel_region.start) {
+        config_node.set_prop("kernel-address", addr)?;
+    } else {
+        config_node.set_prop("kernel-address", kernel_region.start)?;
+    }
     config_node.set_prop("kernel-size", size)?;
     Ok(())
 }
@@ -629,6 +631,22 @@ fn create_nvidia_bpmp_node(fdt: &mut Fdt) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn create_nvidia_dce_nodes(fdt: &mut Fdt, irq: u32) -> Result<()> {
+    let dce_node = fdt.root_mut().subnode_mut("dce")?;
+    dce_node.set_prop("compatible", "nvidia,tegra234-dce")?;
+    dce_node.set_prop("dce-virtual-pa", NVIDIA_DCE_MMIO_BASE)?;
+    dce_node.set_prop("status", "okay")?;
+
+    let interrupts = [GIC_FDT_IRQ_TYPE_SPI, irq, IRQ_TYPE_LEVEL_HIGH];
+    let proxy_node = fdt.root_mut().subnode_mut("dce-guest-proxy")?;
+    proxy_node.set_prop("compatible", "nvidia,dce-guest-proxy")?;
+    proxy_node.set_prop("dce-virtual-pa", NVIDIA_DCE_MMIO_BASE)?;
+    proxy_node.set_prop("interrupts", &interrupts)?;
+    proxy_node.set_prop("status", "okay")?;
+    Ok(())
+}
+
 /// Creates a flattened device tree containing all of the parameters for the
 /// kernel and loads it into the guest memory at the specified offset.
 ///
@@ -681,6 +699,7 @@ pub fn create_fdt(
     virt_cpufreq_v2: bool,
     enable_nested: bool,
     #[cfg(target_os = "linux")] nvidia_bpmp: bool,
+    #[cfg(target_os = "linux")] nvidia_dce_irq: Option<u32>,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -770,6 +789,10 @@ pub fn create_fdt(
     if nvidia_bpmp {
         create_nvidia_bpmp_node(&mut fdt)?;
         phandles.insert("bpmp", PHANDLE_NVIDIA_BPMP);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(irq) = nvidia_dce_irq {
+        create_nvidia_dce_nodes(&mut fdt, irq)?;
     }
     vm_generator(&mut fdt, &phandles)?;
     if vcpu_properties.values().any(|p| !p.frequencies.is_empty()) {
@@ -883,6 +906,34 @@ mod tests {
     }
 
     #[test]
+    fn config_node_supports_high_kernel_address() {
+        let mut fdt = Fdt::new(&[]);
+        let kernel_region = AddressRange::from_start_and_size(0x20_0000_0000, 0x1000).unwrap();
+        create_config_node(&mut fdt, kernel_region).unwrap();
+
+        let config = fdt.get_node("/config").unwrap();
+        assert_eq!(
+            config.get_prop::<u64>("kernel-address").unwrap(),
+            0x20_0000_0000
+        );
+        assert_eq!(config.get_prop::<u32>("kernel-size").unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn config_node_preserves_32_bit_kernel_address() {
+        let mut fdt = Fdt::new(&[]);
+        let kernel_region = AddressRange::from_start_and_size(0x8000_0000, 0x1000).unwrap();
+        create_config_node(&mut fdt, kernel_region).unwrap();
+
+        let config = fdt.get_node("/config").unwrap();
+        assert_eq!(
+            config.get_prop::<u32>("kernel-address").unwrap(),
+            0x8000_0000
+        );
+        assert_eq!(config.get_prop::<u64>("kernel-address"), None);
+    }
+
+    #[test]
     fn psci_compatible_v1_5() {
         // Only the 1.0 and 0.2 versions supported by the kernel should be listed.
         assert_eq!(
@@ -977,5 +1028,32 @@ mod tests {
             PHANDLE_NVIDIA_BPMP
         );
         assert_eq!(fdt.symbol_to_path("bpmp").unwrap().to_string(), "/bpmp");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nvidia_dce_nodes_describe_proxy_and_level_irq() {
+        let mut fdt = Fdt::new(&[]);
+        create_nvidia_dce_nodes(&mut fdt, 73).unwrap();
+
+        let dce = fdt.get_node("/dce").unwrap();
+        assert_eq!(
+            dce.get_prop::<String>("compatible").unwrap(),
+            "nvidia,tegra234-dce"
+        );
+        assert_eq!(
+            dce.get_prop::<u64>("dce-virtual-pa").unwrap(),
+            NVIDIA_DCE_MMIO_BASE
+        );
+
+        let proxy = fdt.get_node("/dce-guest-proxy").unwrap();
+        assert_eq!(
+            proxy.get_prop::<String>("compatible").unwrap(),
+            "nvidia,dce-guest-proxy"
+        );
+        assert_eq!(
+            proxy.get_prop::<Vec<u32>>("interrupts").unwrap(),
+            [GIC_FDT_IRQ_TYPE_SPI, 73, IRQ_TYPE_LEVEL_HIGH]
+        );
     }
 }

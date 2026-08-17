@@ -71,6 +71,13 @@ pub struct VfioOption {
     /// VFIO device.
     pub dt_symbol: Option<String>,
 
+    /// Exact guest physical address for a single-region platform device.
+    pub mmio_base: Option<u64>,
+
+    /// Map platform-device memory before guest execution begins.
+    #[serde(default)]
+    pub map_early: bool,
+
     /// Place the device behind a hotplug-capable root port so it can be removed and re-added.
     #[serde(default)]
     pub removable: bool,
@@ -535,7 +542,11 @@ mod tests {
     fn vfio_platform() {
         let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
             &[],
-            &["--vfio-platform", "/path/to/dev", "/dev/null"],
+            &[
+                "--vfio-platform",
+                "/path/to/dev,dt-symbol=display,mmio-base=0x66230000,map-early=true",
+                "/dev/null",
+            ],
         )
         .unwrap()
         .try_into()
@@ -544,6 +555,9 @@ mod tests {
         let vfio = config.vfio.first().unwrap();
 
         assert_eq!(vfio.path, PathBuf::from("/path/to/dev"));
+        assert_eq!(vfio.dt_symbol.as_deref(), Some("display"));
+        assert_eq!(vfio.mmio_base, Some(0x6623_0000));
+        assert!(vfio.map_early);
     }
 
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -561,6 +575,20 @@ mod tests {
             config.nvidia_bpmp_host,
             Some(PathBuf::from("/dev/bpmp-host"))
         );
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    #[test]
+    fn nvidia_dce_host_path() {
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &["--nvidia-dce-host", "/dev/dce-host", "/dev/null"],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        assert_eq!(config.nvidia_dce_host, Some(PathBuf::from("/dev/dce-host")));
     }
 
     #[test]

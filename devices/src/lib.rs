@@ -22,6 +22,8 @@ pub mod irqchip;
 mod mock;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 mod nvidia_bpmp;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+mod nvidia_dce;
 mod pci;
 mod pflash;
 pub mod pl030;
@@ -102,6 +104,16 @@ pub use self::nvidia_bpmp::NvidiaBpmpHost;
 pub use self::nvidia_bpmp::NVIDIA_BPMP_MMIO_BASE;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub use self::nvidia_bpmp::NVIDIA_BPMP_MMIO_SIZE;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use self::nvidia_dce::NvidiaDceHost;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use self::nvidia_dce::NVIDIA_DCE_EVENT_PAYLOAD_BASE;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use self::nvidia_dce::NVIDIA_DCE_EVENT_PAYLOAD_SIZE;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use self::nvidia_dce::NVIDIA_DCE_MMIO_BASE;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub use self::nvidia_dce::NVIDIA_DCE_MMIO_SIZE;
 pub use self::pci::BarRange;
 pub use self::pci::GpeScope;
 #[cfg(feature = "pci-hotplug")]

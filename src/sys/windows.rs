@@ -2163,6 +2163,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
             force_disable_readonly_mem: cfg.force_disable_readonly_mem,
         },
         vm_image,
+        memory_base: None,
         android_fstab: cfg
             .android_fstab
             .as_ref()
@@ -2175,6 +2176,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         pstore: cfg.pstore.clone(),
         pflash_block_size,
         pflash_image,
+        platform_mmio: None,
         initrd_image,
         extra_kernel_params: cfg.params.clone(),
         acpi_sdts: cfg
