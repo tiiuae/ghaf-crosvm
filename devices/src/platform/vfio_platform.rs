@@ -260,6 +260,24 @@ impl VfioPlatformDevice {
 
             let host = mmap.as_ptr();
             let guest_addr = GuestAddress(guest_map_start);
+
+            // The early path adds a KVM memslot outside GuestMemory after the
+            // NoIommu container's one-time static mapping. Map the same range
+            // into VFIO explicitly so the passthrough engine can DMA only to
+            // this fixed GPA/HPA carveout.
+            //
+            // SAFETY:
+            // mmap owns a valid host mapping of mmap_size bytes and
+            // guest_map_start is the non-overlapping GPA allocated for this
+            // VFIO region.
+            unsafe {
+                self.device
+                    .vfio_dma_map(guest_map_start, mmap_size, host as u64, true)
+            }
+            .with_context(|| {
+                format!("failed to map VFIO DMA for region {index} at {guest_addr}, host {host:?}")
+            })?;
+
             vm.add_memory_region(
                 guest_addr,
                 Box::new(mmap),
