@@ -2,10 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-use std::time::Duration;
-use std::time::Instant;
-
-use base::Clock;
 use base::Error as SysError;
 use base::Event;
 use remain::sorted;
@@ -55,17 +51,12 @@ pub struct Interrupter {
     erdp: Register<u64>,
     event_handler_busy: bool,
     enabled: bool,
-    moderation_interval: u16,
-    moderation_counter: u16,
     event_ring: EventRing,
-    last_interrupt_time: Instant,
-    clock: Clock,
 }
 
 impl Interrupter {
     /// Create a new interrupter.
     pub fn new(mem: GuestMemory, irq_evt: Event, regs: &XhciRegs) -> Self {
-        let clock = Clock::new();
         Interrupter {
             interrupt_evt: irq_evt,
             usbsts: regs.usbsts.clone(),
@@ -73,11 +64,7 @@ impl Interrupter {
             erdp: regs.erdp.clone(),
             event_handler_busy: false,
             enabled: false,
-            moderation_interval: 4000, // default to 1ms as per xhci 5.5.2.2
-            moderation_counter: 0,     // xhci specs leave this as undefined
             event_ring: EventRing::new(mem),
-            last_interrupt_time: clock.now(),
-            clock,
         }
     }
 
@@ -154,10 +141,16 @@ impl Interrupter {
     }
 
     /// Set interrupt moderation.
-    pub fn set_moderation(&mut self, interval: u16, counter: u16) -> Result<()> {
-        xhci_trace!("interrupter set_moderation({}, {})", interval, counter);
-        self.moderation_interval = interval;
-        self.moderation_counter = counter;
+    pub fn set_moderation(&mut self, _interval: u16, _counter: u16) -> Result<()> {
+        xhci_trace!(
+            "interrupter set_moderation({}, {})",
+            _interval,
+            _counter
+        );
+        // Interrupt moderation needs a timer to deliver an event after the moderation interval.
+        // Merely suppressing the interrupt here can strand the event forever if no later event or
+        // register write calls interrupt_if_needed(). Until a timer is implemented, prefer extra
+        // interrupts over losing completions.
         self.interrupt_if_needed()
     }
 
@@ -195,25 +188,93 @@ impl Interrupter {
         self.usbsts.set_bits(USB_STS_EVENT_INTERRUPT);
         self.iman.set_bits(IMAN_INTERRUPT_PENDING);
         self.erdp.set_bits(ERDP_EVENT_HANDLER_BUSY);
-        self.moderation_counter = self.moderation_interval;
-        self.last_interrupt_time = self.clock.now();
         self.interrupt_evt.signal().map_err(Error::SendInterrupt)
     }
 
-    fn interrupt_interval(&self) -> Duration {
-        // Formula from xhci spec 4.17.2 in nanoseconds, but we use the imodc value instead of the
-        // imodi value because our implementation automatically adjusts the range of the duration
-        // based on the remaining time left in the moderation counter, which may be software
-        // defined.
-        Duration::new(0, 250 * u32::from(self.moderation_counter))
-    }
-
     fn interrupt_if_needed(&mut self) -> Result<()> {
-        let can_interrupt = self.last_interrupt_time.elapsed() >= self.interrupt_interval();
-        if self.enabled && can_interrupt && !self.event_ring.is_empty() && !self.event_handler_busy
-        {
+        if self.enabled && !self.event_ring.is_empty() && !self.event_handler_busy {
             self.interrupt()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use base::pagesize;
+    use base::EventWaitResult;
+
+    use super::*;
+    use crate::usb::xhci::xhci_abi::EventRingSegmentTableEntry;
+
+    fn test_regs() -> XhciRegs {
+        let reg32 = register!(
+            name: "test",
+            ty: u32,
+            offset: 0,
+            reset_value: 0,
+            guest_writeable_mask: u32::MAX,
+            guest_write_1_to_clear_mask: 0,
+        );
+        let reg64 = register!(
+            name: "test",
+            ty: u64,
+            offset: 0,
+            reset_value: 0,
+            guest_writeable_mask: u64::MAX,
+            guest_write_1_to_clear_mask: 0,
+        );
+        XhciRegs {
+            usbcmd: reg32.clone(),
+            usbsts: reg32.clone(),
+            dnctrl: reg32.clone(),
+            crcr: reg64.clone(),
+            dcbaap: reg64.clone(),
+            config: reg64.clone(),
+            portsc: vec![reg32.clone(); 16],
+            doorbells: Vec::new(),
+            iman: reg32.clone(),
+            imod: reg32.clone(),
+            erstsz: reg32.clone(),
+            erstba: reg64.clone(),
+            erdp: reg64,
+        }
+    }
+
+    #[test]
+    fn pending_event_is_not_stranded_by_interrupt_moderation() {
+        const SEGMENT_TABLE_ADDR: GuestAddress = GuestAddress(0x40);
+        const EVENT_RING_ADDR: GuestAddress = GuestAddress(0x100);
+
+        let mem = GuestMemory::new(&[(GuestAddress(0), pagesize() as u64)]).unwrap();
+        let mut entry = EventRingSegmentTableEntry::new();
+        entry.set_ring_segment_base_address(EVENT_RING_ADDR.0);
+        entry.set_ring_segment_size(16);
+        mem.write_obj_at_addr(entry, SEGMENT_TABLE_ADDR).unwrap();
+
+        let irq_evt = Event::new().unwrap();
+        let mut interrupter = Interrupter::new(mem, irq_evt.try_clone().unwrap(), &test_regs());
+        interrupter.set_event_ring_seg_table_size(1).unwrap();
+        interrupter
+            .set_event_ring_seg_table_base_addr(SEGMENT_TABLE_ADDR)
+            .unwrap();
+        interrupter
+            .set_event_ring_dequeue_pointer(EVENT_RING_ADDR, false)
+            .unwrap();
+        interrupter.set_enabled(true).unwrap();
+
+        // The previous implementation suppressed this event because it arrived inside the
+        // 16.4 ms moderation window, but had no timer to deliver it after the window expired.
+        interrupter.set_moderation(u16::MAX, u16::MAX).unwrap();
+        interrupter
+            .send_transfer_event_trb(TrbCompletionCode::Success, 0x200, 0, false, 1, 2)
+            .unwrap();
+
+        assert_eq!(
+            irq_evt.wait_timeout(Duration::from_millis(50)).unwrap(),
+            EventWaitResult::Signaled
+        );
     }
 }
