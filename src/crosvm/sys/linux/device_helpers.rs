@@ -1618,6 +1618,7 @@ pub fn create_vfio_device(
             let vfio_plat_dev = VfioPlatformDevice::new(
                 vfio_device,
                 VmMemoryClient::new(vfio_device_tube_mem),
+                iommu_dev,
                 mmio_base,
                 map_early,
             );

@@ -65,12 +65,17 @@ fn validate_required_early_mapping(
     Ok(())
 }
 
+fn needs_early_dma_map(iommu: IommuDevType) -> bool {
+    matches!(iommu, IommuDevType::NoIommu)
+}
+
 pub struct VfioPlatformDevice {
     device: Arc<VfioDevice>,
     interrupt_edge_evt: Vec<IrqEdgeEvent>,
     interrupt_level_evt: Vec<IrqLevelEvent>,
     mmio_regions: Vec<MmioInfo>,
     vm_memory_client: VmMemoryClient,
+    iommu: IommuDevType,
     mmio_base: Option<u64>,
     map_early: bool,
     // scratch MemoryMapping to avoid unmap beform vm exit
@@ -128,6 +133,7 @@ impl VfioPlatformDevice {
     pub fn new(
         device: VfioDevice,
         vm_memory_client: VmMemoryClient,
+        iommu: IommuDevType,
         mmio_base: Option<u64>,
         map_early: bool,
     ) -> Self {
@@ -138,6 +144,7 @@ impl VfioPlatformDevice {
             interrupt_level_evt: Vec::new(),
             mmio_regions: Vec::new(),
             vm_memory_client,
+            iommu,
             mmio_base,
             map_early,
             mem: Vec::new(),
@@ -270,13 +277,17 @@ impl VfioPlatformDevice {
             // mmap owns a valid host mapping of mmap_size bytes and
             // guest_map_start is the non-overlapping GPA allocated for this
             // VFIO region.
-            unsafe {
-                self.device
-                    .vfio_dma_map(guest_map_start, mmap_size, host as u64, true)
+            if needs_early_dma_map(self.iommu) {
+                unsafe {
+                    self.device
+                        .vfio_dma_map(guest_map_start, mmap_size, host as u64, true)
+                }
+                .with_context(|| {
+                    format!(
+                        "failed to map VFIO DMA for region {index} at {guest_addr}, host {host:?}"
+                    )
+                })?;
             }
-            .with_context(|| {
-                format!("failed to map VFIO DMA for region {index} at {guest_addr}, host {host:?}")
-            })?;
 
             vm.add_memory_region(
                 guest_addr,
@@ -555,5 +566,13 @@ mod tests {
             validate_required_early_mapping(true, VFIO_REGION_INFO_FLAG_MMAP, 2, 0x6000_0000,)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn early_dma_map_is_only_for_no_iommu() {
+        assert!(needs_early_dma_map(IommuDevType::NoIommu));
+        assert!(!needs_early_dma_map(IommuDevType::VirtioIommu));
+        assert!(!needs_early_dma_map(IommuDevType::CoIommu));
+        assert!(!needs_early_dma_map(IommuDevType::PkvmPviommu));
     }
 }
