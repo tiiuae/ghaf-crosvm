@@ -1110,21 +1110,22 @@ impl arch::LinuxArch for X8664arch {
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
 
-        let (pci, pci_irqs, pid_debug_label_map, amls, gpe_scope_amls) = arch::generate_pci_root(
-            pci_devices,
-            &*irq_chip,
-            mmio_bus.clone(),
-            GuestAddress(pcie_cfg_mmio_range.start),
-            12,
-            io_bus.clone(),
-            system_allocator,
-            &*vm,
-            4, // Share the four pin interrupts (INTx#)
-            Some(pcie_vcfg_range.start),
-            #[cfg(feature = "swap")]
-            swap_controller,
-        )
-        .map_err(Error::CreatePciRoot)?;
+        let (pci, pci_irqs, pid_debug_label_map, amls, gpe_scope_amls, _pkvm_pci_iommus) =
+            arch::generate_pci_root(
+                pci_devices,
+                &*irq_chip,
+                mmio_bus.clone(),
+                GuestAddress(pcie_cfg_mmio_range.start),
+                12,
+                io_bus.clone(),
+                system_allocator,
+                &*vm,
+                4, // Share the four pin interrupts (INTx#)
+                Some(pcie_vcfg_range.start),
+                #[cfg(feature = "swap")]
+                swap_controller,
+            )
+            .map_err(Error::CreatePciRoot)?;
 
         let pci = Arc::new(Mutex::new(pci));
         pci.lock().enable_pcie_cfg_mmio(pcie_cfg_mmio_range.start);

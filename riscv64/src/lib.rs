@@ -263,7 +263,7 @@ impl arch::LinuxArch for Riscv64 {
             .into_iter()
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
-        let (pci, pci_irqs, mut pid_debug_label_map, _amls, _gpe_scope_amls) =
+        let (pci, pci_irqs, mut pid_debug_label_map, _amls, _gpe_scope_amls, _pkvm_pci_iommus) =
             arch::generate_pci_root(
                 pci_devices,
                 &*irq_chip,

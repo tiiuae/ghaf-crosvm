@@ -83,6 +83,7 @@ use crate::vfio::VfioDevice;
 use crate::vfio::VfioError;
 use crate::vfio::VfioIrqType;
 use crate::vfio::VfioPciConfig;
+use crate::IommuDevType;
 use crate::IrqLevelEvent;
 use crate::Suspendable;
 
@@ -1663,6 +1664,15 @@ impl PciDevice for VfioPciDevice {
 
     fn preferred_address(&self) -> Option<PciAddress> {
         Some(self.preferred_address)
+    }
+
+    fn pkvm_pviommu(&self) -> Option<(u32, Vec<u32>)> {
+        self.device.iommu().and_then(|(iommu_type, id, vsids)| {
+            if !matches!(iommu_type, IommuDevType::PkvmPviommu) {
+                return None;
+            }
+            Some((id?, vsids.to_vec()))
+        })
     }
 
     fn allocate_address(

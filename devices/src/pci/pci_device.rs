@@ -493,6 +493,12 @@ pub trait PciDevice: Send + Suspendable {
         false
     }
 
+    /// Returns the pKVM pvIOMMU identifier and virtual stream IDs assigned to
+    /// this PCI device, when protected assignment is active.
+    fn pkvm_pviommu(&self) -> Option<(u32, Vec<u32>)> {
+        None
+    }
+
     /// Sets the IOMMU for the device if `supports_iommu()`
     fn set_iommu(&mut self, _iommu: IpcMemoryMapper) -> anyhow::Result<()> {
         bail!("Iommu not supported.");
