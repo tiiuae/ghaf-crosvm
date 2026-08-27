@@ -88,6 +88,11 @@ pub enum TransferDirection {
 
 type CancelCallback = Box<dyn FnOnce() -> Result<()> + Send>;
 
+struct CancelOutcome {
+    force_later_cancellations: bool,
+    wait_for_completion: bool,
+}
+
 /// Current state of xhci transfer. The transfer in a Submitted or Cancelling state is owned by the
 /// host and should always be reaped to prevent memory leak.
 pub enum XhciTransferState {
@@ -104,8 +109,11 @@ pub enum XhciTransferState {
 
 impl XhciTransferState {
     /// Try to cancel this transfer, if it's possible.
-    pub fn try_cancel(&mut self, force: bool) -> bool {
-        let mut cancelled = true;
+    fn try_cancel(&mut self, force: bool) -> CancelOutcome {
+        let mut outcome = CancelOutcome {
+            force_later_cancellations: true,
+            wait_for_completion: false,
+        };
         match mem::replace(self, XhciTransferState::Created) {
             XhciTransferState::Submitted { cancel_callback } => {
                 // If we fail to cancel, there are two cases: the URB has already completed
@@ -119,6 +127,7 @@ impl XhciTransferState {
                         *self = XhciTransferState::Cancelling;
                     }
                     Err(_e) => {
+                        outcome.wait_for_completion = true;
                         if force {
                             *self = XhciTransferState::Cancelling;
                         } else {
@@ -126,7 +135,7 @@ impl XhciTransferState {
                             *self = XhciTransferState::Submitted {
                                 cancel_callback: error_callback,
                             };
-                            cancelled = false;
+                            outcome.force_later_cancellations = false;
                         }
                     }
                 }
@@ -139,7 +148,7 @@ impl XhciTransferState {
                 *self = XhciTransferState::Cancelled;
             }
         }
-        cancelled
+        outcome
     }
 }
 
@@ -232,14 +241,11 @@ impl XhciTransferManager {
         t
     }
 
-    /// Cancel all current transfers and execute the callback once completed.
+    /// Cancel all current transfers and execute the callback once endpoint activity has stopped.
     pub fn cancel_all(&self, callback: RingBufferStopCallback) {
         let locked_transfers = self.transfers.lock();
-        if !locked_transfers.is_empty() {
-            self.stop_callback.lock().push(callback);
-        }
-
         let mut force_cancel = false;
+        let mut wait_for_completion = false;
         locked_transfers.iter().for_each(|t| {
             let state = match t.upgrade() {
                 Some(state) => state,
@@ -248,8 +254,20 @@ impl XhciTransferManager {
                     return;
                 }
             };
-            force_cancel |= state.lock().try_cancel(force_cancel);
+            let outcome = state.lock().try_cancel(force_cancel);
+            force_cancel |= outcome.force_later_cancellations;
+            wait_for_completion |= outcome.wait_for_completion;
         });
+
+        // USBDEVFS_DISCARDURB synchronously kills an active URB. Once cancellation succeeds, USB
+        // activity has stopped even though the completion record still needs to be reaped to
+        // release its userspace resources. Holding the Stop Endpoint callback until that reap can
+        // stall the command ring for UAS endpoints, which fan one endpoint out over many stream
+        // rings. Wait only when cancellation lost a race with completion, so the already-completed
+        // transfer is reported to the guest before the Stop Endpoint command completes.
+        if wait_for_completion {
+            self.stop_callback.lock().push(callback);
+        }
     }
 
     fn remove_transfer(&self, t: &Arc<Mutex<XhciTransferState>>) {
@@ -682,6 +700,85 @@ mod tests {
     use crate::usb::xhci::xhci_abi::Trb;
     use crate::usb::xhci::xhci_backend_device::BackendType;
     use crate::usb::xhci::XhciRegs;
+
+    fn add_submitted_transfer(
+        manager: &XhciTransferManager,
+        cancel_callback: CancelCallback,
+    ) -> Arc<Mutex<XhciTransferState>> {
+        let state = Arc::new(Mutex::new(XhciTransferState::Submitted { cancel_callback }));
+        manager.transfers.lock().push_back(Arc::downgrade(&state));
+        state
+    }
+
+    #[test]
+    fn successful_cancellation_completes_stop_without_reap() {
+        let manager = XhciTransferManager::default();
+        let _state = add_submitted_transfer(&manager, Box::new(|| Ok(())));
+        let stopped = Arc::new(Mutex::new(false));
+        let stopped_for_callback = stopped.clone();
+
+        manager.cancel_all(RingBufferStopCallback::new(move || {
+            *stopped_for_callback.lock() = true;
+        }));
+
+        assert!(*stopped.lock());
+        assert!(manager.stop_callback.lock().is_empty());
+    }
+
+    #[test]
+    fn successful_stream_cancellations_release_shared_stop_callback() {
+        let first_stream = XhciTransferManager::default();
+        let second_stream = XhciTransferManager::default();
+        let _first_state = add_submitted_transfer(&first_stream, Box::new(|| Ok(())));
+        let _second_state = add_submitted_transfer(&second_stream, Box::new(|| Ok(())));
+        let stopped = Arc::new(Mutex::new(false));
+        let stopped_for_callback = stopped.clone();
+        let stop_callback = RingBufferStopCallback::new(move || {
+            *stopped_for_callback.lock() = true;
+        });
+
+        first_stream.cancel_all(stop_callback.clone());
+        second_stream.cancel_all(stop_callback.clone());
+        drop(stop_callback);
+
+        assert!(*stopped.lock());
+        assert!(first_stream.stop_callback.lock().is_empty());
+        assert!(second_stream.stop_callback.lock().is_empty());
+    }
+
+    #[test]
+    fn cancellation_race_waits_for_completion() {
+        let manager = XhciTransferManager::default();
+        let _state = add_submitted_transfer(&manager, Box::new(|| Err(Error::CancelTransfer)));
+        let stopped = Arc::new(Mutex::new(false));
+        let stopped_for_callback = stopped.clone();
+
+        manager.cancel_all(RingBufferStopCallback::new(move || {
+            *stopped_for_callback.lock() = true;
+        }));
+
+        assert!(!*stopped.lock());
+        manager.stop_callback.lock().clear();
+        assert!(*stopped.lock());
+    }
+
+    #[test]
+    fn cancellation_failure_after_success_still_waits_for_completion() {
+        let manager = XhciTransferManager::default();
+        let _first_state = add_submitted_transfer(&manager, Box::new(|| Ok(())));
+        let _second_state =
+            add_submitted_transfer(&manager, Box::new(|| Err(Error::CancelTransfer)));
+        let stopped = Arc::new(Mutex::new(false));
+        let stopped_for_callback = stopped.clone();
+
+        manager.cancel_all(RingBufferStopCallback::new(move || {
+            *stopped_for_callback.lock() = true;
+        }));
+
+        assert!(!*stopped.lock());
+        manager.stop_callback.lock().clear();
+        assert!(*stopped.lock());
+    }
 
     fn create_test_transfer(trbs: Vec<Trb>) -> XhciTransfer {
         let mem = GuestMemory::new(&[(GuestAddress(0), pagesize() as u64)]).unwrap();
