@@ -10,10 +10,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use acpi_tables::aml::Aml;
 use base::debug;
 use base::error;
+use base::info;
 use base::pagesize;
 use base::warn;
 use base::AsRawDescriptor;
@@ -83,6 +86,7 @@ use crate::vfio::VfioDevice;
 use crate::vfio::VfioError;
 use crate::vfio::VfioIrqType;
 use crate::vfio::VfioPciConfig;
+use crate::IommuDevType;
 use crate::IrqLevelEvent;
 use crate::Suspendable;
 
@@ -90,6 +94,7 @@ const PCI_VENDOR_ID: u32 = 0x0;
 const PCI_DEVICE_ID: u32 = 0x2;
 const PCI_COMMAND: u32 = 0x4;
 const PCI_COMMAND_MEMORY: u8 = 0x2;
+const PCI_COMMAND_MASTER: u16 = 0x4;
 const PCI_BASE_CLASS_CODE: u32 = 0x0B;
 const PCI_INTERRUPT_NUM: u32 = 0x3C;
 const PCI_INTERRUPT_PIN: u32 = 0x3D;
@@ -98,6 +103,17 @@ const PCI_CAPABILITY_LIST: u32 = 0x34;
 const PCI_CAP_ID_MSI: u8 = 0x05;
 const PCI_CAP_ID_MSIX: u8 = 0x11;
 const PCI_CAP_ID_PM: u8 = 0x01;
+const PCI_PM_CTRL: u32 = 0x4;
+const PCI_PM_CTRL_STATE_MASK: u16 = 0x3;
+const PCI_PM_D0_DELAY: Duration = Duration::from_millis(10);
+
+fn pkvm_reset_command(command: u16) -> u16 {
+    (command | u16::from(PCI_COMMAND_MEMORY)) & !PCI_COMMAND_MASTER
+}
+
+fn pkvm_reset_pmcsr(pmcsr: u16) -> u16 {
+    pmcsr & !PCI_PM_CTRL_STATE_MASK
+}
 
 fn vfio_region_is_backed(size: u64) -> bool {
     size != 0
@@ -718,6 +734,7 @@ pub struct VfioPciDevice {
     acpi_notifier_val: Arc<Mutex<Vec<u32>>>,
     gpe: Option<u32>,
     base_class_code: PciClassCode,
+    closed: bool,
 }
 
 impl VfioPciDevice {
@@ -888,6 +905,7 @@ impl VfioPciDevice {
             acpi_notifier_val: Arc::new(Mutex::new(Vec::new())),
             gpe: None,
             base_class_code,
+            closed: false,
         })
     }
 
@@ -1274,6 +1292,12 @@ impl VfioPciDevice {
     }
 
     fn close(&mut self) {
+        if self.closed {
+            return;
+        }
+        self.closed = true;
+        self.stop_work_thread();
+
         if let Some(msi) = self.msi_cap.as_mut() {
             msi.destroy();
         }
@@ -1281,7 +1305,74 @@ impl VfioPciDevice {
             msix.lock().destroy();
         }
         self.disable_bars_mmap();
+
+        if self
+            .device
+            .iommu()
+            .is_some_and(|(iommu_type, _, _)| matches!(iommu_type, IommuDevType::PkvmPviommu))
+        {
+            self.prepare_for_pkvm_reset();
+        }
+
         self.device.close();
+    }
+
+    fn stop_work_thread(&mut self) {
+        if let Some(worker_thread) = self.worker_thread.take() {
+            let res = worker_thread.stop();
+            self.pci_address = Some(res.address);
+            self.sysfs_path = res.sysfs_path;
+            self.pm_cap = res.pm_cap;
+            self.msix_cap = res.msix_cap;
+            self.vm_socket_vm = Some(res.vm_socket);
+        }
+    }
+
+    fn prepare_for_pkvm_reset(&self) {
+        let mut final_pmcsr = None;
+        if let Some(pm_cap) = &self.pm_cap {
+            let pmcsr_offset = pm_cap.lock().offset + PCI_PM_CTRL;
+            let pmcsr: u16 = self.config.read_config(pmcsr_offset);
+            let reset_pmcsr = pkvm_reset_pmcsr(pmcsr);
+
+            if reset_pmcsr != pmcsr {
+                self.config.write_config(reset_pmcsr, pmcsr_offset);
+                thread::sleep(PCI_PM_D0_DELAY);
+            }
+
+            let current_pmcsr: u16 = self.config.read_config(pmcsr_offset);
+            final_pmcsr = Some(current_pmcsr);
+            if current_pmcsr & PCI_PM_CTRL_STATE_MASK != 0 {
+                error!(
+                    "failed to put protected VFIO PCI device {} in D0 before pKVM reset: PMCSR={:#06x}",
+                    self.device.device_name(),
+                    current_pmcsr
+                );
+            }
+        }
+
+        let command: u16 = self.config.read_config(PCI_COMMAND);
+        let reset_command = pkvm_reset_command(command);
+        if reset_command != command {
+            self.config.write_config(reset_command, PCI_COMMAND);
+        }
+
+        let current_command: u16 = self.config.read_config(PCI_COMMAND);
+        if current_command & u16::from(PCI_COMMAND_MEMORY) == 0
+            || current_command & PCI_COMMAND_MASTER != 0
+        {
+            error!(
+                "failed to prepare protected VFIO PCI device {} for pKVM reset: command={:#06x}",
+                self.device.device_name(),
+                current_command
+            );
+        }
+        info!(
+            "prepared protected VFIO PCI device {} for pKVM reset: PMCSR={:?}, command={:#06x}",
+            self.device.device_name(),
+            final_pmcsr,
+            current_command
+        );
     }
 
     fn start_work_thread(&mut self) {
@@ -1663,6 +1754,15 @@ impl PciDevice for VfioPciDevice {
 
     fn preferred_address(&self) -> Option<PciAddress> {
         Some(self.preferred_address)
+    }
+
+    fn pkvm_pviommu(&self) -> Option<(u32, Vec<u32>)> {
+        self.device.iommu().and_then(|(iommu_type, id, vsids)| {
+            if !matches!(iommu_type, IommuDevType::PkvmPviommu) {
+                return None;
+            }
+            Some((id?, vsids.to_vec()))
+        })
     }
 
     fn allocate_address(
@@ -2153,16 +2253,15 @@ impl PciDevice for VfioPciDevice {
     }
 }
 
+impl Drop for VfioPciDevice {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl Suspendable for VfioPciDevice {
     fn sleep(&mut self) -> anyhow::Result<()> {
-        if let Some(worker_thread) = self.worker_thread.take() {
-            let res = worker_thread.stop();
-            self.pci_address = Some(res.address);
-            self.sysfs_path = res.sysfs_path;
-            self.pm_cap = res.pm_cap;
-            self.msix_cap = res.msix_cap;
-            self.vm_socket_vm = Some(res.vm_socket);
-        }
+        self.stop_work_thread();
         Ok(())
     }
 
@@ -2179,17 +2278,35 @@ mod tests {
     use resources::AddressRange;
 
     use super::find_mmio_region;
+    use super::pkvm_reset_command;
+    use super::pkvm_reset_pmcsr;
     use super::vfio_region_is_backed;
     use super::PciBarConfiguration;
     use super::PciBarIndex;
     use super::PciBarPrefetchable;
     use super::PciBarRegionType;
     use super::VfioResourceAllocator;
+    use super::PCI_COMMAND_MASTER;
+    use super::PCI_COMMAND_MEMORY;
 
     #[test]
     fn zero_size_vfio_region_is_not_backed() {
         assert!(!vfio_region_is_backed(0));
         assert!(vfio_region_is_backed(1));
+    }
+
+    #[test]
+    fn protected_reset_enables_memory_and_disables_bus_mastering() {
+        let command = pkvm_reset_command(PCI_COMMAND_MASTER | 0x1);
+
+        assert_ne!(command & u16::from(PCI_COMMAND_MEMORY), 0);
+        assert_eq!(command & PCI_COMMAND_MASTER, 0);
+        assert_ne!(command & 0x1, 0);
+    }
+
+    #[test]
+    fn protected_reset_forces_d0_without_changing_other_pmcsr_bits() {
+        assert_eq!(pkvm_reset_pmcsr(0x8103), 0x8100);
     }
 
     #[test]

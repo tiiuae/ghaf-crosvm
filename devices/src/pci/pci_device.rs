@@ -493,6 +493,12 @@ pub trait PciDevice: Send + Suspendable {
         false
     }
 
+    /// Returns the pKVM pvIOMMU identifier and virtual stream IDs assigned to
+    /// this PCI device, when protected assignment is active.
+    fn pkvm_pviommu(&self) -> Option<(u32, Vec<u32>)> {
+        None
+    }
+
     /// Sets the IOMMU for the device if `supports_iommu()`
     fn set_iommu(&mut self, _iommu: IpcMemoryMapper) -> anyhow::Result<()> {
         bail!("Iommu not supported.");
@@ -843,6 +849,10 @@ impl<T: PciDevice + ?Sized> PciDevice for Box<T> {
     ) -> Result<Vec<BarRange>> {
         (**self).configure_bridge_window(resources, bar_ranges)
     }
+
+    fn pkvm_pviommu(&self) -> Option<(u32, Vec<u32>)> {
+        (**self).pkvm_pviommu()
+    }
 }
 
 impl<T: PciDevice + ?Sized> Suspendable for Box<T> {
@@ -927,6 +937,50 @@ mod tests {
     }
 
     impl Suspendable for TestDev {}
+
+    struct PkvmTestDev;
+
+    impl PciDevice for PkvmTestDev {
+        fn debug_label(&self) -> String {
+            "pkvm-test".to_owned()
+        }
+
+        fn allocate_address(&mut self, _resources: &mut SystemAllocator) -> Result<PciAddress> {
+            Err(Error::PciAllocationFailed)
+        }
+
+        fn keep_rds(&self) -> Vec<RawDescriptor> {
+            Vec::new()
+        }
+
+        fn get_bar_configuration(&self, _bar_num: usize) -> Option<PciBarConfiguration> {
+            None
+        }
+
+        fn read_config_register(&self, _reg_idx: usize) -> u32 {
+            0
+        }
+
+        fn write_config_register(&mut self, _reg_idx: usize, _offset: u64, _data: &[u8]) {}
+
+        fn read_bar(&mut self, _bar_index: PciBarIndex, _offset: u64, _data: &mut [u8]) {}
+
+        fn write_bar(&mut self, _bar_index: PciBarIndex, _offset: u64, _data: &[u8]) {}
+
+        fn pkvm_pviommu(&self) -> Option<(u32, Vec<u32>)> {
+            Some((7, vec![0x77]))
+        }
+    }
+
+    impl Suspendable for PkvmTestDev {}
+
+    #[test]
+    fn boxed_device_forwards_pkvm_pviommu() {
+        let device: Box<dyn PciDevice> = Box::new(PkvmTestDev);
+        let boxed: Box<dyn PciDevice> = Box::new(device);
+
+        assert_eq!(boxed.pkvm_pviommu(), Some((7, vec![0x77])));
+    }
 
     #[test]
     fn config_write_result() {

@@ -906,7 +906,7 @@ impl arch::LinuxArch for AArch64 {
             .into_iter()
             .map(|(dev, jail_orig)| (dev.into_pci_device().unwrap(), jail_orig))
             .collect();
-        let (pci, pci_irqs, mut pid_debug_label_map, _amls, _gpe_scope_amls) =
+        let (pci, pci_irqs, mut pid_debug_label_map, _amls, _gpe_scope_amls, pkvm_pci_iommus) =
             arch::generate_pci_root(
                 pci_devices,
                 &*irq_chip,
@@ -1189,6 +1189,7 @@ impl arch::LinuxArch for AArch64 {
             pci_irqs,
             pci_cfg,
             &pci_ranges,
+            pkvm_pci_iommus,
             dev_resources,
             vcpu_count as u32,
             &|n| get_vcpu_mpidr_aff(&vcpus, n),

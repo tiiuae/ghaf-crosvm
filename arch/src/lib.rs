@@ -1115,16 +1115,21 @@ pub fn generate_pci_root(
         BTreeMap<u32, String>,
         BTreeMap<PciAddress, Vec<u8>>,
         BTreeMap<PciAddress, Vec<u8>>,
+        Vec<(PciAddress, u32, Vec<u32>)>,
     ),
     DeviceRegistrationError,
 > {
     let mut device_addrs = Vec::new();
+    let mut pkvm_pci_iommus = Vec::new();
 
     for (device, _jail) in devices.iter_mut() {
         let address = device
             .allocate_address(resources)
             .map_err(DeviceRegistrationError::AllocateDeviceAddrs)?;
         device_addrs.push(address);
+        if let Some((pviommu_id, vsids)) = device.pkvm_pviommu() {
+            pkvm_pci_iommus.push((address, pviommu_id, vsids));
+        }
     }
 
     let mut device_ranges = BTreeMap::new();
@@ -1335,7 +1340,14 @@ pub fn generate_pci_root(
         }
     }
 
-    Ok((root, pci_irqs, pid_labels, amls, gpe_scope_amls))
+    Ok((
+        root,
+        pci_irqs,
+        pid_labels,
+        amls,
+        gpe_scope_amls,
+        pkvm_pci_iommus,
+    ))
 }
 
 /// Errors for image loading.

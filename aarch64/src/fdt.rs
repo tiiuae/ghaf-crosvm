@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -359,8 +359,11 @@ fn create_kvm_cpufreq_node(fdt: &mut Fdt) -> Result<()> {
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
-fn get_pkvm_pviommu_ids(platform_dev_resources: &Vec<PlatformBusResources>) -> Result<Vec<u32>> {
-    let mut ids = HashSet::new();
+fn get_pkvm_pviommu_ids(
+    platform_dev_resources: &Vec<PlatformBusResources>,
+    pci_iommus: &[(PciAddress, u32, Vec<u32>)],
+) -> Result<Vec<u32>> {
+    let mut ids = BTreeSet::new();
 
     for res in platform_dev_resources {
         for iommu in &res.iommus {
@@ -370,7 +373,39 @@ fn get_pkvm_pviommu_ids(platform_dev_resources: &Vec<PlatformBusResources>) -> R
         }
     }
 
+    ids.extend(pci_iommus.iter().map(|(_, id, _)| *id));
+
     Ok(Vec::from_iter(ids))
+}
+
+fn add_pkvm_pci_iommu_map(
+    fdt: &mut Fdt,
+    pci_iommus: &[(PciAddress, u32, Vec<u32>)],
+    phandles: &BTreeMap<&str, u32>,
+) -> Result<()> {
+    let mut entries = pci_iommus.to_vec();
+    entries.sort_by_key(|(address, _, _)| (address.bus, address.dev, address.func));
+    let mut iommu_map = Vec::new();
+
+    for (address, pviommu_id, vsids) in entries {
+        if vsids.len() != 1 {
+            return Err(Error::PropertyValueInvalid);
+        }
+        let key = format!("pviommu{pviommu_id}");
+        let phandle = *phandles
+            .get(key.as_str())
+            .ok_or(Error::PropertyValueInvalid)?;
+        let requester_id =
+            (u32::from(address.bus) << 8) | (u32::from(address.dev) << 3) | u32::from(address.func);
+        iommu_map.extend([requester_id, phandle, vsids[0], 1]);
+    }
+
+    if !iommu_map.is_empty() {
+        let pci_node = fdt.root_mut().subnode_mut("pci")?;
+        pci_node.set_prop("iommu-map", iommu_map)?;
+        pci_node.set_prop("iommu-map-mask", 0xffffu32)?;
+    }
+    Ok(())
 }
 
 fn create_pkvm_pviommu_node(fdt: &mut Fdt, index: usize, id: u32) -> Result<u32> {
@@ -675,6 +710,7 @@ pub fn create_fdt(
     pci_irqs: Vec<(PciAddress, u32, PciInterruptPin)>,
     pci_cfg: PciConfigRegion,
     pci_ranges: &[PciRange],
+    pkvm_pci_iommus: Vec<(PciAddress, u32, Vec<u32>)>,
     platform_dev_resources: Vec<PlatformBusResources>,
     num_vcpus: u32,
     cpu_mpidr_generator: &impl Fn(usize) -> Option<u64>,
@@ -803,7 +839,7 @@ pub fn create_fdt(
         }
     }
 
-    let pviommu_ids = get_pkvm_pviommu_ids(&platform_dev_resources)?;
+    let pviommu_ids = get_pkvm_pviommu_ids(&platform_dev_resources, &pkvm_pci_iommus)?;
 
     let cache_offset_pviommu = phandles_key_cache.len();
     // Hack to extend the lifetime of the Strings as keys of phandles (i.e. &str).
@@ -823,6 +859,7 @@ pub fn create_fdt(
         let phandle = create_pkvm_pviommu_node(&mut fdt, index, *id)?;
         phandles.insert(key, phandle);
     }
+    add_pkvm_pci_iommu_map(&mut fdt, &pkvm_pci_iommus, &phandles)?;
 
     for (index, key) in pdomains_phandle_keys.iter().enumerate() {
         let phandle = create_pkvm_power_domain_node(&mut fdt, index)?;
@@ -1055,5 +1092,41 @@ mod tests {
             proxy.get_prop::<Vec<u32>>("interrupts").unwrap(),
             [GIC_FDT_IRQ_TYPE_SPI, 73, IRQ_TYPE_LEVEL_HIGH]
         );
+    }
+
+    #[test]
+    fn pkvm_pci_iommu_map_uses_guest_requester_ids() {
+        let mut fdt = Fdt::new(&[]);
+        fdt.root_mut().subnode_mut("pci").unwrap();
+        let phandles = BTreeMap::from([("pviommu7", 0x1007), ("pviommu9", 0x1009)]);
+        let pci_iommus = vec![
+            (
+                PciAddress {
+                    bus: 2,
+                    dev: 3,
+                    func: 1,
+                },
+                9,
+                vec![0x99],
+            ),
+            (
+                PciAddress {
+                    bus: 0,
+                    dev: 0x1f,
+                    func: 0,
+                },
+                7,
+                vec![0x77],
+            ),
+        ];
+
+        add_pkvm_pci_iommu_map(&mut fdt, &pci_iommus, &phandles).unwrap();
+
+        let pci = fdt.get_node("/pci").unwrap();
+        assert_eq!(
+            pci.get_prop::<Vec<u32>>("iommu-map").unwrap(),
+            vec![0xf8, 0x1007, 0x77, 1, 0x219, 0x1009, 0x99, 1]
+        );
+        assert_eq!(pci.get_prop::<u32>("iommu-map-mask").unwrap(), 0xffff);
     }
 }

@@ -166,9 +166,40 @@ pub enum VfioDeviceType {
     Platform,
 }
 
-enum KvmVfioGroupOps {
+enum KvmVfioFileOps {
     Add,
     Delete,
+}
+
+fn kvm_device_set_file<T: AsRawDescriptor>(
+    vfio_file: &T,
+    kvm_vfio_file: &SafeDescriptor,
+    ops: KvmVfioFileOps,
+) -> Result<()> {
+    let vfio_descriptor = vfio_file.as_raw_descriptor();
+    let vfio_descriptor_ptr = &vfio_descriptor as *const i32;
+    let vfio_dev_attr = match ops {
+        KvmVfioFileOps::Add => kvm_sys::kvm_device_attr {
+            flags: 0,
+            group: kvm_sys::KVM_DEV_VFIO_FILE,
+            attr: kvm_sys::KVM_DEV_VFIO_FILE_ADD as u64,
+            addr: vfio_descriptor_ptr as u64,
+        },
+        KvmVfioFileOps::Delete => kvm_sys::kvm_device_attr {
+            flags: 0,
+            group: kvm_sys::KVM_DEV_VFIO_FILE,
+            attr: kvm_sys::KVM_DEV_VFIO_FILE_DEL as u64,
+            addr: vfio_descriptor_ptr as u64,
+        },
+    };
+
+    // SAFETY:
+    // Safe as the KVM VFIO descriptor and attribute are valid, and the return value is checked.
+    if 0 != unsafe { ioctl_with_ref(kvm_vfio_file, kvm_sys::KVM_SET_DEVICE_ATTR, &vfio_dev_attr) } {
+        return Err(VfioError::KvmSetDeviceAttr(get_error()));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -651,10 +682,11 @@ impl VfioContainer {
             }
         }
 
-        let kvm_vfio_file = create_kvm_vfio_file(vm).ok_or(VfioError::CreateVfioKvmDevice)?;
-        group
-            .lock()
-            .kvm_device_set_group(kvm_vfio_file, KvmVfioGroupOps::Add)?;
+        if !matches!(iommu_dev, IommuDevType::PkvmPviommu) {
+            let kvm_vfio_file = create_kvm_vfio_file(vm).ok_or(VfioError::CreateVfioKvmDevice)?;
+            kvm_device_set_file(&*group.lock(), kvm_vfio_file, KvmVfioFileOps::Add)?;
+            group.lock().kvm_registered = true;
+        }
 
         self.groups.insert(id, group.clone());
 
@@ -686,13 +718,13 @@ impl VfioContainer {
                 group.lock().reduce_device_num();
             }
             if group.lock().device_num() == 0 {
-                let kvm_vfio_file = kvm_vfio_file().expect("kvm vfio file isn't created");
-                if group
-                    .lock()
-                    .kvm_device_set_group(kvm_vfio_file, KvmVfioGroupOps::Delete)
-                    .is_err()
-                {
-                    warn!("failing in remove vfio group from kvm device");
+                if group.lock().kvm_registered {
+                    let kvm_vfio_file = kvm_vfio_file().expect("kvm vfio file isn't created");
+                    if kvm_device_set_file(&*group.lock(), kvm_vfio_file, KvmVfioFileOps::Delete)
+                        .is_err()
+                    {
+                        warn!("failing in remove vfio group from kvm device");
+                    }
                 }
                 remove = true;
             }
@@ -729,6 +761,7 @@ impl AsRawDescriptor for VfioContainer {
 struct VfioGroup {
     group: File,
     device_num: u32,
+    kvm_registered: bool,
 }
 
 impl VfioGroup {
@@ -774,6 +807,7 @@ impl VfioGroup {
         Ok(VfioGroup {
             group: group_file,
             device_num: 0,
+            kvm_registered: false,
         })
     }
 
@@ -791,40 +825,6 @@ impl VfioGroup {
             .map_err(|_| VfioError::InvalidPath)?;
 
         Ok(group_id)
-    }
-
-    fn kvm_device_set_group(
-        &self,
-        kvm_vfio_file: &SafeDescriptor,
-        ops: KvmVfioGroupOps,
-    ) -> Result<()> {
-        let group_descriptor = self.as_raw_descriptor();
-        let group_descriptor_ptr = &group_descriptor as *const i32;
-        let vfio_dev_attr = match ops {
-            KvmVfioGroupOps::Add => kvm_sys::kvm_device_attr {
-                flags: 0,
-                group: kvm_sys::KVM_DEV_VFIO_GROUP,
-                attr: kvm_sys::KVM_DEV_VFIO_GROUP_ADD as u64,
-                addr: group_descriptor_ptr as u64,
-            },
-            KvmVfioGroupOps::Delete => kvm_sys::kvm_device_attr {
-                flags: 0,
-                group: kvm_sys::KVM_DEV_VFIO_GROUP,
-                attr: kvm_sys::KVM_DEV_VFIO_GROUP_DEL as u64,
-                addr: group_descriptor_ptr as u64,
-            },
-        };
-
-        // SAFETY:
-        // Safe as we are the owner of vfio_dev_descriptor and vfio_dev_attr which are valid value,
-        // and we verify the return value.
-        if 0 != unsafe {
-            ioctl_with_ref(kvm_vfio_file, kvm_sys::KVM_SET_DEVICE_ATTR, &vfio_dev_attr)
-        } {
-            return Err(VfioError::KvmSetDeviceAttr(get_error()));
-        }
-
-        Ok(())
     }
 
     fn get_device(&self, name: &str) -> Result<File> {
@@ -1034,32 +1034,66 @@ impl VfioDevice {
         let name_str = name_osstr.to_str().ok_or(VfioError::InvalidPath)?;
         let name = String::from(name_str);
         let dev = group.lock().get_device(&name)?;
-        let (dev_info, dev_type) = Self::get_device_info(&dev)?;
-        Self::reset_if_supported(&dev, &dev_info)?;
-        let regions = Self::get_regions(&dev, dev_info.num_regions)?;
+        let kvm_registered = matches!(iommu_dev, IommuDevType::PkvmPviommu);
+        if kvm_registered {
+            let kvm_vfio_file = create_kvm_vfio_file(vm).ok_or(VfioError::CreateVfioKvmDevice)?;
+            if let Err(e) = kvm_device_set_file(&dev, kvm_vfio_file, KvmVfioFileOps::Add) {
+                container.lock().remove_group(group_id, false);
+                return Err(e);
+            }
+        }
+
+        let initialized = (|| {
+            let (dev_info, dev_type) = Self::get_device_info(&dev)?;
+            Self::reset_if_supported(&dev, &dev_info)?;
+            let regions = Self::get_regions(&dev, dev_info.num_regions)?;
+
+            let iova_ranges = container.lock().vfio_iommu_iova_get_iova_ranges()?;
+            let iova_alloc = AddressAllocator::new_from_list(iova_ranges, None, None)
+                .map_err(VfioError::Resources)?;
+
+            let pviommu = if matches!(iommu_dev, IommuDevType::PkvmPviommu) {
+                // We currently have a 1-to-1 mapping between pvIOMMUs and VFIO devices.
+                let pviommu = KvmVfioPviommu::new(vm)?;
+
+                let vsids_len = KvmVfioPviommu::get_sid_count(vm, &dev)?.try_into().unwrap();
+                let max_vsid = u32::MAX.try_into().unwrap();
+                let random_vsids = sample(&mut rand::rng(), max_vsid, vsids_len).into_iter();
+                let vsids = Vec::from_iter(random_vsids.map(|v| u32::try_from(v).unwrap()));
+                for (i, vsid) in vsids.iter().enumerate() {
+                    pviommu.attach(&dev, i.try_into().unwrap(), *vsid)?;
+                }
+
+                Some((Arc::new(Mutex::new(pviommu)), vsids))
+            } else {
+                None
+            };
+
+            Ok((
+                dev_type,
+                regions,
+                dev_info.num_irqs,
+                Arc::new(Mutex::new(iova_alloc)),
+                pviommu,
+            ))
+        })();
+
+        let (dev_type, regions, num_irqs, iova_alloc, pviommu) = match initialized {
+            Ok(initialized) => initialized,
+            Err(e) => {
+                if kvm_registered {
+                    let kvm_vfio_file = kvm_vfio_file().expect("kvm vfio file isn't created");
+                    if kvm_device_set_file(&dev, kvm_vfio_file, KvmVfioFileOps::Delete).is_err() {
+                        warn!("failing to remove vfio device from kvm after initialization error");
+                    }
+                }
+                container.lock().remove_group(group_id, false);
+                return Err(e);
+            }
+        };
+
         group.lock().add_device_num();
         let group_descriptor = group.lock().as_raw_descriptor();
-
-        let iova_ranges = container.lock().vfio_iommu_iova_get_iova_ranges()?;
-        let iova_alloc = AddressAllocator::new_from_list(iova_ranges, None, None)
-            .map_err(VfioError::Resources)?;
-
-        let pviommu = if matches!(iommu_dev, IommuDevType::PkvmPviommu) {
-            // We currently have a 1-to-1 mapping between pvIOMMUs and VFIO devices.
-            let pviommu = KvmVfioPviommu::new(vm)?;
-
-            let vsids_len = KvmVfioPviommu::get_sid_count(vm, &dev)?.try_into().unwrap();
-            let max_vsid = u32::MAX.try_into().unwrap();
-            let random_vsids = sample(&mut rand::rng(), max_vsid, vsids_len).into_iter();
-            let vsids = Vec::from_iter(random_vsids.map(|v| u32::try_from(v).unwrap()));
-            for (i, vsid) in vsids.iter().enumerate() {
-                pviommu.attach(&dev, i.try_into().unwrap(), *vsid)?;
-            }
-
-            Some((Arc::new(Mutex::new(pviommu)), vsids))
-        } else {
-            None
-        };
 
         Ok(VfioDevice {
             dev,
@@ -1069,8 +1103,8 @@ impl VfioDevice {
             group_descriptor,
             group_id,
             regions,
-            num_irqs: dev_info.num_irqs,
-            iova_alloc: Arc::new(Mutex::new(iova_alloc)),
+            num_irqs,
+            iova_alloc,
             dt_symbol,
             pviommu,
         })
@@ -1963,6 +1997,10 @@ impl VfioDevice {
 
     /// close vfio device
     pub fn close(&self) {
+        // Protected PCI assignment is static for the VM lifetime. Keep the device registered until
+        // the KVM VM is released: KVM holds an additional VFIO file reference and pKVM resets the
+        // device while tearing down the VM's stage-2 mappings. Removing the file here can let VFIO
+        // disable PCI BAR decoding before that reset. KVM releases the registration afterwards.
         self.container.lock().remove_group(self.group_id, true);
     }
 }
