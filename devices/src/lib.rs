@@ -233,6 +233,7 @@ pub struct PlatformBusResources {
     pub regions: Vec<(u64, u64)>, // (start address, size)
     pub irqs: Vec<(u32, u32)>,    // (IRQ number, flags)
     pub iommus: Vec<(IommuDevType, Option<u32>, Vec<u32>)>, // (IOMMU type, IOMMU identifier, IDs)
+    pub iommu_group: Option<u32>, // Host VFIO group shared by platform devices
     pub requires_power_domain: bool,
 }
 
@@ -246,6 +247,7 @@ impl PlatformBusResources {
             regions: vec![],
             irqs: vec![],
             iommus: vec![],
+            iommu_group: None,
             requires_power_domain: false,
         }
     }

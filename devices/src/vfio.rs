@@ -85,10 +85,14 @@ pub enum VfioError {
     IommuGetCapInfo,
     #[error("failed to get IOMMU info from host: {0}")]
     IommuGetInfo(Error),
+    #[error("failed to create pKVM pvIOMMU: {0}")]
+    KvmCreatePviommuAttr(Error),
+    #[error("failed to query pKVM pvIOMMU device information: {0}")]
+    KvmGetPviommuInfoAttr(Error),
     #[error("failed to attach device to pKVM pvIOMMU: {0}")]
     KvmPviommuSetConfig(Error),
-    #[error("failed to set KVM vfio device's attribute: {0}")]
-    KvmSetDeviceAttr(Error),
+    #[error("failed to add or remove KVM VFIO file: {0}")]
+    KvmSetFileAttr(Error),
     #[error("AddressAllocator is unavailable")]
     NoRescAlloc,
     #[error("failed to open /dev/vfio/vfio container: {0}")]
@@ -196,7 +200,7 @@ fn kvm_device_set_file<T: AsRawDescriptor>(
     // SAFETY:
     // Safe as the KVM VFIO descriptor and attribute are valid, and the return value is checked.
     if 0 != unsafe { ioctl_with_ref(kvm_vfio_file, kvm_sys::KVM_SET_DEVICE_ATTR, &vfio_dev_attr) } {
-        return Err(VfioError::KvmSetDeviceAttr(get_error()));
+        return Err(VfioError::KvmSetFileAttr(get_error()));
     }
 
     Ok(())
@@ -271,7 +275,7 @@ impl KvmVfioPviommu {
             unsafe { ioctl_with_ref(kvm_vfio_file, kvm_sys::KVM_SET_DEVICE_ATTR, &vfio_dev_attr) };
 
         if ret < 0 {
-            Err(VfioError::KvmSetDeviceAttr(get_error()))
+            Err(VfioError::KvmCreatePviommuAttr(get_error()))
         } else {
             // SAFETY: Safe as we verify the return value.
             Ok(unsafe { File::from_raw_descriptor(ret) })
@@ -332,7 +336,7 @@ impl KvmVfioPviommu {
             unsafe { ioctl_with_ref(kvm_vfio_file, kvm_sys::KVM_SET_DEVICE_ATTR, &vfio_dev_attr) };
 
         if ret < 0 {
-            Err(VfioError::KvmSetDeviceAttr(get_error()))
+            Err(VfioError::KvmGetPviommuInfoAttr(get_error()))
         } else {
             Ok(info)
         }
@@ -762,6 +766,7 @@ struct VfioGroup {
     group: File,
     device_num: u32,
     kvm_registered: bool,
+    pviommu: Option<Arc<Mutex<KvmVfioPviommu>>>,
 }
 
 impl VfioGroup {
@@ -808,7 +813,18 @@ impl VfioGroup {
             group: group_file,
             device_num: 0,
             kvm_registered: false,
+            pviommu: None,
         })
+    }
+
+    fn get_or_create_pviommu(&mut self, vm: &dyn Vm) -> Result<Arc<Mutex<KvmVfioPviommu>>> {
+        if let Some(pviommu) = &self.pviommu {
+            return Ok(pviommu.clone());
+        }
+
+        let pviommu = Arc::new(Mutex::new(KvmVfioPviommu::new(vm)?));
+        self.pviommu = Some(pviommu.clone());
+        Ok(pviommu)
     }
 
     fn get_group_id<P: AsRef<Path>>(sysfspath: P) -> Result<u32> {
@@ -1053,18 +1069,20 @@ impl VfioDevice {
                 .map_err(VfioError::Resources)?;
 
             let pviommu = if matches!(iommu_dev, IommuDevType::PkvmPviommu) {
-                // We currently have a 1-to-1 mapping between pvIOMMUs and VFIO devices.
-                let pviommu = KvmVfioPviommu::new(vm)?;
+                // All devices in one host VFIO group share the same physical IOMMU context.
+                // Keep their virtual routes in one pvIOMMU as well so assigning a second device
+                // cannot replace the context installed by the first one.
+                let pviommu = group.lock().get_or_create_pviommu(vm)?;
 
                 let vsids_len = KvmVfioPviommu::get_sid_count(vm, &dev)?.try_into().unwrap();
                 let max_vsid = u32::MAX.try_into().unwrap();
                 let random_vsids = sample(&mut rand::rng(), max_vsid, vsids_len).into_iter();
                 let vsids = Vec::from_iter(random_vsids.map(|v| u32::try_from(v).unwrap()));
                 for (i, vsid) in vsids.iter().enumerate() {
-                    pviommu.attach(&dev, i.try_into().unwrap(), *vsid)?;
+                    pviommu.lock().attach(&dev, i.try_into().unwrap(), *vsid)?;
                 }
 
-                Some((Arc::new(Mutex::new(pviommu)), vsids))
+                Some((pviommu, vsids))
             } else {
                 None
             };
@@ -1200,6 +1218,11 @@ impl VfioDevice {
         } else {
             None
         }
+    }
+
+    /// Returns the host VFIO group containing this device.
+    pub fn iommu_group(&self) -> u32 {
+        self.group_id
     }
 
     /// Probes support for VFIO LOW_POWER features.

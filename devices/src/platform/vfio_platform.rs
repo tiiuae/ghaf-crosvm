@@ -155,6 +155,10 @@ impl VfioPlatformDevice {
         self.device.get_irqs()
     }
 
+    pub fn iommu_group(&self) -> u32 {
+        self.device.iommu_group()
+    }
+
     pub fn irq_is_automask(&self, irq: &VfioIrq) -> bool {
         irq.flags & VFIO_IRQ_INFO_AUTOMASKED != 0
     }
