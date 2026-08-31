@@ -561,27 +561,23 @@ impl Drop for ScopedUmask {
 struct ScopedFsetid(Caps);
 impl Drop for ScopedFsetid {
     fn drop(&mut self) {
-        if let Err(e) = raise_cap_fsetid(&mut self.0) {
+        if let Err(e) = self.0.apply() {
             error!(
-                "Failed to restore CAP_FSETID: {}.  Some operations may be broken.",
+                "Failed to restore capabilities after dropping CAP_FSETID: {}.  Some operations may be broken.",
                 e
             )
         }
     }
 }
 
-fn raise_cap_fsetid(c: &mut Caps) -> io::Result<()> {
-    c.update(&[Capability::Fsetid], CapSet::Effective, CapValue::Set)?;
-    c.apply()
-}
-
 // Drops CAP_FSETID from the effective set for the current thread and returns an RAII guard that
-// adds the capability back when it is dropped.
+// restores the original capability sets when it is dropped.
 fn drop_cap_fsetid() -> io::Result<ScopedFsetid> {
-    let mut caps = Caps::for_current_thread()?;
-    caps.update(&[Capability::Fsetid], CapSet::Effective, CapValue::Clear)?;
-    caps.apply()?;
-    Ok(ScopedFsetid(caps))
+    let original_caps = Caps::for_current_thread()?;
+    let mut dropped_caps = Caps::for_current_thread()?;
+    dropped_caps.update(&[Capability::Fsetid], CapSet::Effective, CapValue::Clear)?;
+    dropped_caps.apply()?;
+    Ok(ScopedFsetid(original_caps))
 }
 
 fn ebadf() -> io::Error {
