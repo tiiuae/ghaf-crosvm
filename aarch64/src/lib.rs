@@ -31,7 +31,6 @@ use base::warn;
 use base::MemoryMappingBuilder;
 use base::SendTube;
 #[cfg(target_os = "linux")]
-use base::SharedMemory;
 use base::Tube;
 use devices::serial_device::SerialHardware;
 use devices::serial_device::SerialParameters;
@@ -64,10 +63,6 @@ use devices::VirtCpufreqV2;
 use devices::NVIDIA_BPMP_MMIO_BASE;
 #[cfg(target_os = "linux")]
 use devices::NVIDIA_BPMP_MMIO_SIZE;
-#[cfg(target_os = "linux")]
-use devices::NVIDIA_DCE_EVENT_PAYLOAD_BASE;
-#[cfg(target_os = "linux")]
-use devices::NVIDIA_DCE_EVENT_PAYLOAD_SIZE;
 #[cfg(target_os = "linux")]
 use devices::NVIDIA_DCE_MMIO_BASE;
 #[cfg(target_os = "linux")]
@@ -264,14 +259,10 @@ fn get_swiotlb_addr(
 #[sorted]
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("failed to add NVIDIA DCE event payload: {0}")]
-    AddNvidiaDcePayload(base::Error),
     #[error("failed to allocate IRQ number")]
     AllocateIrq,
     #[error("bios could not be loaded: {0}")]
     BiosLoadFailure(arch::LoadImageError),
-    #[error("failed to create NVIDIA DCE event payload: {0}")]
-    BuildNvidiaDcePayload(base::Error),
     #[error("failed to build arm pvtime memory: {0}")]
     BuildPvtimeError(base::MmapError),
     #[error("unable to clone an Event: {0}")]
@@ -342,8 +333,6 @@ pub enum Error {
     KernelLoadFailure(kernel_loader::Error),
     #[error("error loading Kernel from Elf image: {0}")]
     LoadElfKernel(kernel_loader::Error),
-    #[error("failed to map NVIDIA DCE event payload: {0}")]
-    MapNvidiaDcePayload(base::MmapError),
     #[error("failed to map arm pvtime memory: {0}")]
     MapPvtimeError(base::Error),
     #[error("missing power manager for assigned devices")]
@@ -835,30 +824,14 @@ impl arch::LinuxArch for AArch64 {
 
         #[cfg(target_os = "linux")]
         let nvidia_dce_irq = if let Some(host_device) = components.nvidia_dce_host.take() {
-            let event_memory = SharedMemory::new("nvidia-dce-event", NVIDIA_DCE_EVENT_PAYLOAD_SIZE)
-                .map_err(Error::BuildNvidiaDcePayload)?;
-            let device_mapping = MemoryMappingBuilder::new(NVIDIA_DCE_EVENT_PAYLOAD_SIZE as usize)
-                .from_shared_memory(&event_memory)
-                .build()
-                .map_err(Error::MapNvidiaDcePayload)?;
-            let guest_mapping = MemoryMappingBuilder::new(NVIDIA_DCE_EVENT_PAYLOAD_SIZE as usize)
-                .from_shared_memory(&event_memory)
-                .build()
-                .map_err(Error::MapNvidiaDcePayload)?;
-            vm.add_memory_region(
-                GuestAddress(NVIDIA_DCE_EVENT_PAYLOAD_BASE),
-                Box::new(guest_mapping),
-                false,
-                false,
-                MemCacheType::CacheCoherent,
-            )
-            .map_err(Error::AddNvidiaDcePayload)?;
-
             let irq = system_allocator.allocate_irq().ok_or(Error::AllocateIrq)?;
             let irq_event = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
             let device_irq = irq_event.try_clone().map_err(Error::CloneEvent)?;
-            let dce = NvidiaDceHost::new(host_device, device_mapping, device_irq)
-                .map_err(Error::CreateNvidiaDce)?;
+            // Keep the event payload in the emulated MMIO device. A protected guest can make
+            // KVM memslot backing inaccessible to the host, so a second userspace mapping is not
+            // safe for asynchronous DCE event delivery.
+            let dce =
+                NvidiaDceHost::new(host_device, device_irq).map_err(Error::CreateNvidiaDce)?;
             irq_chip
                 .register_level_irq_event(irq, &irq_event, IrqEventSource::from_device(&dce))
                 .map_err(Error::RegisterIrqfd)?;

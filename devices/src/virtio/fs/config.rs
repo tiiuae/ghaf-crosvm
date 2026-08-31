@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#[cfg(feature = "fs_permission_translation")]
 use std::io;
 #[cfg(feature = "fs_permission_translation")]
 use std::str::FromStr;
@@ -16,6 +15,92 @@ use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
 use serde_keyvalue::FromKeyValues;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IdMapEntry {
+    guest_start: u32,
+    host_start: u32,
+    count: u32,
+}
+
+impl IdMapEntry {
+    fn guest_to_host(&self, id: u32) -> Option<u32> {
+        let offset = id.checked_sub(self.guest_start)?;
+        (offset < self.count)
+            .then(|| self.host_start.checked_add(offset))
+            .flatten()
+    }
+
+    fn host_to_guest(&self, id: u32) -> Option<u32> {
+        let offset = id.checked_sub(self.host_start)?;
+        (offset < self.count)
+            .then(|| self.guest_start.checked_add(offset))
+            .flatten()
+    }
+}
+
+/// UID and GID translations matching Linux user-namespace map syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdMap {
+    uid: Vec<IdMapEntry>,
+    gid: Vec<IdMapEntry>,
+}
+
+impl IdMap {
+    pub fn from_linux_maps(uid_map: &str, gid_map: &str) -> io::Result<Self> {
+        Ok(Self {
+            uid: Self::parse_linux_map(uid_map)?,
+            gid: Self::parse_linux_map(gid_map)?,
+        })
+    }
+
+    fn parse_linux_map(map: &str) -> io::Result<Vec<IdMapEntry>> {
+        let entries = map
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| {
+                let fields = entry
+                    .split_whitespace()
+                    .map(str::parse::<u32>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+                if fields.len() != 3 || fields[2] == 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                }
+                fields[0]
+                    .checked_add(fields[2] - 1)
+                    .and_then(|_| fields[1].checked_add(fields[2] - 1))
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+                Ok(IdMapEntry {
+                    guest_start: fields[0],
+                    host_start: fields[1],
+                    count: fields[2],
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        if entries.is_empty() {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        Ok(entries)
+    }
+
+    pub(crate) fn guest_uid_to_host(&self, id: u32) -> Option<u32> {
+        self.uid.iter().find_map(|entry| entry.guest_to_host(id))
+    }
+
+    pub(crate) fn guest_gid_to_host(&self, id: u32) -> Option<u32> {
+        self.gid.iter().find_map(|entry| entry.guest_to_host(id))
+    }
+
+    pub(crate) fn host_uid_to_guest(&self, id: u32) -> Option<u32> {
+        self.uid.iter().find_map(|entry| entry.host_to_guest(id))
+    }
+
+    pub(crate) fn host_gid_to_guest(&self, id: u32) -> Option<u32> {
+        self.gid.iter().find_map(|entry| entry.host_to_guest(id))
+    }
+}
 
 /// The caching policy that the file system should report to the FUSE client. By default the FUSE
 /// protocol uses close-to-open consistency. This means that any cached contents of the file are
@@ -323,6 +408,10 @@ pub struct Config {
     #[serde(default = "config_default_security_ctx")]
     pub security_ctx: bool,
 
+    /// User-namespace identity mapping used by an in-process filesystem backend.
+    #[serde(skip)]
+    pub id_map: Option<IdMap>,
+
     // Specifies run-time UID/GID mapping that works without user namespaces.
     //
     // The virtio-fs usually does mapping of UIDs/GIDs between host and guest with user namespace.
@@ -372,11 +461,37 @@ impl Default for Config {
             max_dynamic_perm: 0,
             max_dynamic_xattr: 0,
             security_ctx: config_default_security_ctx(),
+            id_map: None,
             #[cfg(feature = "fs_runtime_ugid_map")]
             ugid_map: Vec::new(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             unmap_guest_memory_on_fork: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod id_map_tests {
+    use super::*;
+
+    #[test]
+    fn linux_id_map_translates_in_both_directions() {
+        let map = IdMap::from_linux_maps("0 999 1, 1000 2000 10", "0 302 1").unwrap();
+
+        assert_eq!(map.guest_uid_to_host(0), Some(999));
+        assert_eq!(map.guest_uid_to_host(1004), Some(2004));
+        assert_eq!(map.host_uid_to_guest(2009), Some(1009));
+        assert_eq!(map.guest_gid_to_host(0), Some(302));
+        assert_eq!(map.host_gid_to_guest(302), Some(0));
+        assert_eq!(map.guest_uid_to_host(42), None);
+    }
+
+    #[test]
+    fn linux_id_map_rejects_invalid_ranges() {
+        assert!(IdMap::from_linux_maps("0 999 0", "0 302 1").is_err());
+        assert!(IdMap::from_linux_maps("0 999", "0 302 1").is_err());
+        assert!(IdMap::from_linux_maps("4294967295 0 2", "0 302 1").is_err());
+        assert!(IdMap::from_linux_maps("", "0 302 1").is_err());
     }
 }
 

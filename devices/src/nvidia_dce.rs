@@ -18,7 +18,6 @@ use std::time::Duration;
 
 use base::error;
 use base::EventWaitResult;
-use base::MemoryMapping;
 use vm_control::DeviceId;
 use vm_control::PlatformDeviceId;
 
@@ -111,6 +110,7 @@ impl DceBackend for HostDevice {
 
 struct DceState {
     control: [u8; EVENT_BUFFER],
+    event_payload: [u8; EVENT_MAX],
     sequence: u32,
     acknowledged: u32,
 }
@@ -118,7 +118,6 @@ struct DceState {
 struct SharedState {
     state: Mutex<DceState>,
     ack: Condvar,
-    event_payload: Arc<MemoryMapping>,
     irq: IrqLevelEvent,
     stopping: AtomicBool,
 }
@@ -132,12 +131,11 @@ pub struct NvidiaDceHost {
 }
 
 impl NvidiaDceHost {
-    pub fn new(file: File, event_payload: MemoryMapping, irq: IrqLevelEvent) -> io::Result<Self> {
+    pub fn new(file: File, irq: IrqLevelEvent) -> io::Result<Self> {
         let event_file = file.try_clone()?;
         Ok(Self::new_with_backend(
             Box::new(HostDevice(file)),
             Some(event_file),
-            event_payload,
             irq,
         ))
     }
@@ -145,7 +143,6 @@ impl NvidiaDceHost {
     fn new_with_backend(
         backend: Box<dyn DceBackend>,
         event_file: Option<File>,
-        event_payload: MemoryMapping,
         irq: IrqLevelEvent,
     ) -> Self {
         Self {
@@ -155,11 +152,11 @@ impl NvidiaDceHost {
             shared: Arc::new(SharedState {
                 state: Mutex::new(DceState {
                     control: [0; EVENT_BUFFER],
+                    event_payload: [0; EVENT_MAX],
                     sequence: 0,
                     acknowledged: 0,
                 }),
                 ack: Condvar::new(),
-                event_payload: Arc::new(event_payload),
                 irq,
                 stopping: AtomicBool::new(false),
             }),
@@ -261,14 +258,7 @@ impl BusDevice for NvidiaDceHost {
                 data.fill(0);
                 return;
             };
-            if self
-                .shared
-                .event_payload
-                .read_slice(data, range.start)
-                .is_err()
-            {
-                data.fill(0);
-            }
+            data.copy_from_slice(&self.shared.state.lock().unwrap().event_payload[range]);
             return;
         }
 
@@ -288,7 +278,7 @@ impl BusDevice for NvidiaDceHost {
             else {
                 return;
             };
-            let _ = self.shared.event_payload.write_slice(data, range.start);
+            self.shared.state.lock().unwrap().event_payload[range].copy_from_slice(data);
             return;
         }
 
@@ -379,11 +369,8 @@ fn read_host_event(file: &File) -> io::Result<Option<DceHostEvent>> {
 }
 
 fn publish_event(shared: &SharedState, event: &DceHostEvent) -> io::Result<u32> {
-    shared
-        .event_payload
-        .write_slice(&event.data[..event.size as usize], 0)
-        .map_err(io::Error::other)?;
     let mut state = shared.state.lock().unwrap();
+    state.event_payload[..event.size as usize].copy_from_slice(&event.data[..event.size as usize]);
     state.control[EVENT_INTERFACE..EVENT_INTERFACE + 4]
         .copy_from_slice(&event.interface.to_le_bytes());
     state.control[EVENT_SIZE..EVENT_SIZE + 4].copy_from_slice(&event.size.to_le_bytes());
@@ -435,8 +422,6 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::Mutex as StdMutex;
 
-    use base::MemoryMappingBuilder;
-
     use super::*;
 
     #[derive(Default)]
@@ -486,7 +471,6 @@ mod tests {
         NvidiaDceHost::new_with_backend(
             Box::new(TestBackend(state)),
             None,
-            MemoryMappingBuilder::new(EVENT_MAX).build().unwrap(),
             IrqLevelEvent::new().unwrap(),
         )
     }

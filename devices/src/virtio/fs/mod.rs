@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -54,6 +55,7 @@ mod worker;
 pub use allowlist::PathAllowlist;
 pub use config::CachePolicy;
 pub use config::Config;
+pub use config::IdMap;
 use fuse::Server;
 use passthrough::PassthroughFs;
 pub use worker::Worker;
@@ -137,6 +139,7 @@ impl Fs {
         num_workers: usize,
         fs_cfg: Config,
         tube: Tube,
+        root_dir: Option<&Path>,
     ) -> Result<Fs> {
         if tag.len() > FS_MAX_TAG_LEN {
             return Err(Error::TagTooLong(tag.len()));
@@ -150,7 +153,11 @@ impl Fs {
             num_request_queues: Le32::from(num_workers as u32),
         };
 
-        let fs = PassthroughFs::new(tag, fs_cfg).map_err(Error::CreateFs)?;
+        let mut fs = PassthroughFs::new(tag, fs_cfg).map_err(Error::CreateFs)?;
+        if let Some(root_dir) = root_dir {
+            fs.set_root_dir(root_dir.to_string_lossy().into_owned())
+                .map_err(Error::CreateFs)?;
+        }
 
         // There is always a high priority queue in addition to the request queues.
         let num_queues = num_workers + 1;

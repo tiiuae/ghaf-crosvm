@@ -243,6 +243,7 @@ pub fn generate_platform_bus(
             device_resources
                 .iommus
                 .push((iommu_type, id, vsids.to_vec()));
+            device_resources.iommu_group = Some(device.iommu_group());
         }
 
         let arced_dev: Arc<Mutex<dyn BusDevice>> = if let Some(jail) = jail {

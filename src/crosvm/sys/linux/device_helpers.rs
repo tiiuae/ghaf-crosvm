@@ -1110,13 +1110,13 @@ pub fn create_fs_device(
     gid_map: &str,
     src: &Path,
     tag: &str,
-    fs_cfg: virtio::fs::Config,
+    mut fs_cfg: virtio::fs::Config,
     device_tube: Tube,
 ) -> DeviceResult {
     let max_open_files = base::linux::max_open_files()
         .context("failed to get max number of open files")?
         .rlim_max;
-    let j = if let Some(jail_config) = jail_config {
+    let (j, root_dir) = if let Some(jail_config) = jail_config {
         let mut config = SandboxConfig::new(jail_config, "fs_device");
         config.limit_caps = false;
         config.ugid_map = Some((uid_map, gid_map));
@@ -1128,20 +1128,30 @@ pub fn create_fs_device(
         } else {
             RunAsUser::Specified(ugid.0.unwrap_or(0), ugid.1.unwrap_or(0))
         };
-        create_sandbox_minijail(src, max_open_files, &config)?
+        (
+            Some(create_sandbox_minijail(src, max_open_files, &config)?),
+            None,
+        )
     } else {
-        create_base_minijail(src, max_open_files)?
+        // `--disable-sandbox` must not fork a filesystem device after another
+        // device has started threads. Keep the backend in-process and constrain
+        // every filesystem operation to the canonical shared directory instead.
+        fs_cfg.id_map = Some(
+            virtio::fs::IdMap::from_linux_maps(uid_map, gid_map)
+                .context("failed to parse filesystem UID/GID maps")?,
+        );
+        (None, Some(src))
     };
 
     let features = virtio::base_features(protection_type);
     // TODO(chirantan): Use more than one worker once the kernel driver has been fixed to not panic
     // when num_queues > 1.
-    let dev = virtio::fs::Fs::new(features, tag, 1, fs_cfg, device_tube)
+    let dev = virtio::fs::Fs::new(features, tag, 1, fs_cfg, device_tube, root_dir)
         .context("failed to create fs device")?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
-        jail: Some(j),
+        jail: j,
     })
 }
 
@@ -1678,4 +1688,28 @@ pub fn setup_virtio_access_platform(
         translate_response_senders,
         tube_pair.map(|(_request_tx, request_rx)| request_rx),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fs_without_sandbox_stays_in_process() {
+        let (_host_tube, device_tube) = Tube::pair().unwrap();
+        let stub = create_fs_device(
+            ProtectionType::Unprotected,
+            None,
+            (None, None),
+            "",
+            "",
+            Path::new("/"),
+            "test-fs",
+            virtio::fs::Config::default(),
+            device_tube,
+        )
+        .unwrap();
+
+        assert!(stub.jail.is_none());
+    }
 }

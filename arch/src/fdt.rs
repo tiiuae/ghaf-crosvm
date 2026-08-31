@@ -118,6 +118,10 @@ fn patch_fdt_node(
         node.set_prop("iommus", iommus_val)?;
     }
 
+    if let Some(group) = resources.iommu_group {
+        node.set_prop("pkvm,iommu-group-id", group)?;
+    }
+
     if resources.requires_power_domain {
         let phandle = get_power_domain_phandle(*power_domain_count, phandles)?;
         node.set_prop("power-domains", phandle)?;
@@ -314,6 +318,7 @@ mod tests {
             regions: vec![(0x1000, 0x100)],
             irqs: vec![(5, 1)],
             iommus: vec![(IommuDevType::PkvmPviommu, Some(1), vec![10])],
+            iommu_group: Some(7),
             requires_power_domain: true,
         };
 
@@ -329,6 +334,7 @@ mod tests {
         assert_eq!(root.get_prop("interrupts"), Some(vec![0u32, 5, 1]));
         assert_eq!(root.get_prop("power-domains"), Some(vec![42u32]));
         assert_eq!(root.get_prop("iommus"), Some(vec![43u32, 10]));
+        assert_eq!(root.get_prop("pkvm,iommu-group-id"), Some(7u32));
         assert_eq!(power_domain_count, 1);
     }
 
@@ -342,6 +348,7 @@ mod tests {
             regions: vec![],
             irqs: vec![],
             iommus: vec![],
+            iommu_group: None,
             requires_power_domain: true,
         };
 
@@ -369,6 +376,7 @@ mod tests {
                 (IommuDevType::PkvmPviommu, Some(1), vec![10]),
                 (IommuDevType::PkvmPviommu, Some(2), vec![20]),
             ],
+            iommu_group: None,
             requires_power_domain: false,
         };
 
@@ -399,6 +407,7 @@ mod tests {
             regions: vec![(0x1000, 0x100)],
             irqs: vec![],
             iommus: vec![],
+            iommu_group: None,
             requires_power_domain: false,
         };
 
@@ -420,6 +429,7 @@ mod tests {
             regions: vec![],
             irqs: vec![],
             iommus: vec![(IommuDevType::VirtioIommu, Some(1), vec![10])],
+            iommu_group: None,
             requires_power_domain: false,
         };
 
@@ -443,6 +453,7 @@ mod tests {
             regions: vec![],
             irqs: vec![],
             iommus: vec![(IommuDevType::PkvmPviommu, Some(1), vec![10])],
+            iommu_group: None,
             requires_power_domain: false,
         };
 
