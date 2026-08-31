@@ -55,6 +55,7 @@ mod worker;
 pub use allowlist::PathAllowlist;
 pub use config::CachePolicy;
 pub use config::Config;
+pub use config::IdMap;
 use fuse::Server;
 use passthrough::PassthroughFs;
 pub use worker::Worker;

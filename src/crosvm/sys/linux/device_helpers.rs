@@ -1110,7 +1110,7 @@ pub fn create_fs_device(
     gid_map: &str,
     src: &Path,
     tag: &str,
-    fs_cfg: virtio::fs::Config,
+    mut fs_cfg: virtio::fs::Config,
     device_tube: Tube,
 ) -> DeviceResult {
     let max_open_files = base::linux::max_open_files()
@@ -1136,6 +1136,10 @@ pub fn create_fs_device(
         // `--disable-sandbox` must not fork a filesystem device after another
         // device has started threads. Keep the backend in-process and constrain
         // every filesystem operation to the canonical shared directory instead.
+        fs_cfg.id_map = Some(
+            virtio::fs::IdMap::from_linux_maps(uid_map, gid_map)
+                .context("failed to parse filesystem UID/GID maps")?,
+        );
         (None, Some(src))
     };
 

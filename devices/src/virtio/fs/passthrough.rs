@@ -1029,6 +1029,49 @@ impl PassthroughFs {
         Ok(())
     }
 
+    fn translate_stat_ids(&self, st: &mut libc::stat64, path: &str) {
+        if let Some(id_map) = &self.cfg.id_map {
+            st.st_uid = id_map.host_uid_to_guest(st.st_uid).unwrap_or(st.st_uid);
+            st.st_gid = id_map.host_gid_to_guest(st.st_gid).unwrap_or(st.st_gid);
+            return;
+        }
+
+        #[cfg(feature = "arc_quota")]
+        self.set_permission(st, path);
+        #[cfg(all(not(feature = "arc_quota"), feature = "fs_runtime_ugid_map"))]
+        self.set_ugid_permission(st, path);
+    }
+
+    fn translate_request_ids(
+        &self,
+        ctx: &Context,
+        parent_data: &InodeData,
+        name: &CStr,
+    ) -> (u32, u32) {
+        let path = format!(
+            "{}/{}",
+            parent_data.path,
+            name.to_str().unwrap_or("<non UTF-8 str>")
+        );
+        self.translate_request_ids_for_path(ctx, &path)
+    }
+
+    fn translate_request_ids_for_path(&self, ctx: &Context, path: &str) -> (u32, u32) {
+        if let Some(id_map) = &self.cfg.id_map {
+            return (
+                id_map.guest_uid_to_host(ctx.uid).unwrap_or(ctx.uid),
+                id_map.guest_gid_to_host(ctx.gid).unwrap_or(ctx.gid),
+            );
+        }
+
+        #[cfg(feature = "arc_quota")]
+        return self.change_creds_for_path(ctx, path);
+        #[cfg(all(not(feature = "arc_quota"), feature = "fs_runtime_ugid_map"))]
+        return self.change_ugid_creds_for_path(ctx, path);
+        #[cfg(not(any(feature = "arc_quota", feature = "fs_runtime_ugid_map")))]
+        return (ctx.uid, ctx.gid);
+    }
+
     pub fn cfg(&self) -> &Config {
         &self.cfg
     }
@@ -1145,10 +1188,7 @@ impl PassthroughFs {
         open_flags: libc::c_int,
         path: String,
     ) -> Entry {
-        #[cfg(feature = "arc_quota")]
-        self.set_permission(&mut st, &path);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        self.set_ugid_permission(&mut st, &path);
+        self.translate_stat_ids(&mut st, &path);
         let mut inodes = self.inodes.lock();
 
         let altkey = InodeAltKey {
@@ -1250,10 +1290,7 @@ impl PassthroughFs {
         // Check if we already have an entry before opening a new file.
         if let Some(data) = self.inodes.lock().get_alt(&altkey) {
             // Return the same inode with the reference counter increased.
-            #[cfg(feature = "arc_quota")]
-            self.set_permission(&mut st, &path);
-            #[cfg(feature = "fs_runtime_ugid_map")]
-            self.set_ugid_permission(&mut st, &path);
+            self.translate_stat_ids(&mut st, &path);
             return Ok(Entry {
                 inode: self.increase_inode_refcount(data),
                 generation: 0,
@@ -1375,10 +1412,7 @@ impl PassthroughFs {
         #[allow(unused_mut)]
         let mut st = stat(inode)?;
 
-        #[cfg(feature = "arc_quota")]
-        self.set_permission(&mut st, &inode.path);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        self.set_ugid_permission(&mut st, &inode.path);
+        self.translate_stat_ids(&mut st, &inode.path);
         Ok((st, self.cfg.timeout))
     }
 
@@ -2505,13 +2539,7 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
-        #[allow(unused_variables)]
-        #[cfg(feature = "arc_quota")]
-        let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
-        #[cfg(not(feature = "fs_permission_translation"))]
-        let (uid, gid) = (ctx.uid, ctx.gid);
+        let (uid, gid) = self.translate_request_ids(&ctx, &data, name);
 
         let (_uid, _gid) = set_creds(uid, gid)?;
         {
@@ -2644,13 +2672,7 @@ impl FileSystem for PassthroughFs {
 
         let current_dir = c".";
 
-        #[allow(unused_variables)]
-        #[cfg(feature = "arc_quota")]
-        let (uid, gid) = self.change_creds(&ctx, &data, current_dir);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        let (uid, gid) = self.change_ugid_creds(&ctx, &data, current_dir);
-        #[cfg(not(feature = "fs_permission_translation"))]
-        let (uid, gid) = (ctx.uid, ctx.gid);
+        let (uid, gid) = self.translate_request_ids(&ctx, &data, current_dir);
 
         let (_uid, _gid) = set_creds(uid, gid)?;
 
@@ -2708,13 +2730,7 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
-        #[allow(unused_variables)]
-        #[cfg(feature = "arc_quota")]
-        let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
-        #[cfg(not(feature = "fs_permission_translation"))]
-        let (uid, gid) = (ctx.uid, ctx.gid);
+        let (uid, gid) = self.translate_request_ids(&ctx, &data, name);
 
         let (_uid, _gid) = set_creds(uid, gid)?;
 
@@ -3071,13 +3087,7 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
-        #[allow(unused_variables)]
-        #[cfg(feature = "arc_quota")]
-        let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
-        #[cfg(not(feature = "fs_permission_translation"))]
-        let (uid, gid) = (ctx.uid, ctx.gid);
+        let (uid, gid) = self.translate_request_ids(&ctx, &data, name);
 
         let (_uid, _gid) = set_creds(uid, gid)?;
         {
@@ -3153,13 +3163,7 @@ impl FileSystem for PassthroughFs {
             .map(|ctx| ScopedSecurityContext::new(&self.proc, ctx))
             .transpose()?;
 
-        #[allow(unused_variables)]
-        #[cfg(feature = "arc_quota")]
-        let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
-        #[cfg(not(feature = "fs_permission_translation"))]
-        let (uid, gid) = (ctx.uid, ctx.gid);
+        let (uid, gid) = self.translate_request_ids(&ctx, &data, name);
 
         let (_uid, _gid) = set_creds(uid, gid)?;
         {
@@ -3659,13 +3663,7 @@ impl FileSystem for PassthroughFs {
         );
         let dst_inode_data = self.find_inode(inode_dst)?;
 
-        #[allow(unused_variables)]
-        #[cfg(feature = "arc_quota")]
-        let (uid, gid) = self.change_creds_for_path(&ctx, &dst_inode_data.path);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        let (uid, gid) = self.change_ugid_creds_for_path(&ctx, &dst_inode_data.path);
-        #[cfg(not(feature = "fs_permission_translation"))]
-        let (uid, gid) = (ctx.uid, ctx.gid);
+        let (uid, gid) = self.translate_request_ids_for_path(&ctx, &dst_inode_data.path);
 
         // We need to change credentials during a write so that the kernel will remove setuid or
         // setgid bits from the file if it was written to by someone other than the owner.
@@ -3798,13 +3796,7 @@ impl FileSystem for PassthroughFs {
         // Perform lookup but not create negative dentry
         let data = self.find_inode(parent)?;
 
-        #[allow(unused_variables)]
-        #[cfg(feature = "arc_quota")]
-        let (uid, gid) = self.change_creds(&ctx, &data, name);
-        #[cfg(feature = "fs_runtime_ugid_map")]
-        let (uid, gid) = self.change_ugid_creds(&ctx, &data, name);
-        #[cfg(not(feature = "fs_permission_translation"))]
-        let (uid, gid) = (ctx.uid, ctx.gid);
+        let (uid, gid) = self.translate_request_ids(&ctx, &data, name);
 
         let (_uid, _gid) = set_creds(uid, gid)?;
 
