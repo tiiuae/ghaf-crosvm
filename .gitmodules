@@ -1,9 +1,3 @@
 [submodule "third_party/minijail"]
 	path = third_party/minijail
 	url = https://chromium.googlesource.com/chromiumos/platform/minijail
-[submodule "third_party/depot_tools"]
-	path = third_party/depot_tools
-	url = https://chromium.googlesource.com/chromium/tools/depot_tools.git
-[submodule "third_party/perfetto"]
-	path = third_party/perfetto
-	url = https://chromium.googlesource.com/crosvm/perfetto/
