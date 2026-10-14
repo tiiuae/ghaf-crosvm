@@ -75,6 +75,8 @@ pub struct VfioPlatformDevice {
     map_early: bool,
     // scratch MemoryMapping to avoid unmap beform vm exit
     mem: Vec<MemoryMapping>,
+    // regions_mmap() runs after every trapped access; map only once.
+    regions_mapped: bool,
 }
 
 impl BusDevice for VfioPlatformDevice {
@@ -141,6 +143,7 @@ impl VfioPlatformDevice {
             mmio_base,
             map_early,
             mem: Vec::new(),
+            regions_mapped: false,
         }
     }
 
@@ -307,6 +310,7 @@ impl VfioPlatformDevice {
             )?;
             self.region_mmap_early(vm, mmio_info.index, mmio_info.start)?;
         }
+        self.regions_mapped = true;
         Ok(())
     }
 
@@ -385,6 +389,10 @@ impl VfioPlatformDevice {
     }
 
     fn regions_mmap(&mut self) {
+        if self.regions_mapped {
+            return;
+        }
+        self.regions_mapped = true;
         for mmio_info in self.mmio_regions.iter() {
             let mut mem_map = self.region_mmap(mmio_info.index, mmio_info.start);
             self.mem.append(&mut mem_map);
