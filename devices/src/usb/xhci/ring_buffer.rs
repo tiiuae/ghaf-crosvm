@@ -77,6 +77,26 @@ impl RingBuffer {
 
     /// Dequeue next transfer descriptor from the transfer ring.
     pub fn dequeue_transfer_descriptor(&mut self) -> Result<Option<TransferDescriptor>> {
+        // A transfer descriptor can span several chained TRBs, and the guest
+        // writes them one at a time. Reading while it is only part way through
+        // yields a prefix whose last TRB still has the chain bit set: there is
+        // no complete descriptor to run yet.
+        //
+        // Consuming that prefix is destructive. The dequeue pointer has moved
+        // past TRBs that were never turned into a transfer, and if the prefix
+        // crossed a Link TRB the consumer cycle state has toggled a wrap early.
+        // Every later TRB then disagrees with the consumer cycle state, so the
+        // ring reads as permanently empty and no work is ever submitted again --
+        // silently, because an empty ring is an ordinary condition, not an
+        // error. Measured on a UAS disk: the guest rang the doorbell 674 times
+        // in 30 s while crosvm submitted nothing and logged only a debug line.
+        //
+        // So remember where this descriptor started and rewind if it turns out
+        // to be incomplete. The guest rings the doorbell again once it has
+        // written the rest, and re-reading from the start is idempotent.
+        let start_dequeue_pointer = self.dequeue_pointer;
+        let start_consumer_cycle_state = self.consumer_cycle_state;
+
         let mut trbs = Vec::new();
         while let Some(addressed_trb) = self.get_current_trb()? {
             if let Ok(TrbType::Link) = addressed_trb.trb.get_trb_type() {
@@ -114,10 +134,20 @@ impl RingBuffer {
         match trbs.last() {
             Some(t) => {
                 if t.trb.get_chain_bit().map_err(Error::TrbChain)? {
+                    // Incomplete descriptor: put back everything this call
+                    // consumed, including any Link TRB toggle.
+                    self.dequeue_pointer = start_dequeue_pointer;
+                    self.consumer_cycle_state = start_consumer_cycle_state;
                     return Ok(None);
                 }
             }
-            None => return Ok(None),
+            None => {
+                // Nothing to run, but the loop may still have followed a Link
+                // TRB before finding an invalid one, which moves both.
+                self.dequeue_pointer = start_dequeue_pointer;
+                self.consumer_cycle_state = start_consumer_cycle_state;
+                return Ok(None);
+            }
         }
         Ok(TransferDescriptor::new(trbs))
     }

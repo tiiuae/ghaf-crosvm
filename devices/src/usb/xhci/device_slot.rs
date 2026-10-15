@@ -782,6 +782,7 @@ impl DeviceSlot {
         endpoint_id: u8,
         stream_id: u16,
         ptr: u64,
+        dequeue_cycle_state: bool,
     ) -> Result<TrbCompletionCode> {
         if !valid_endpoint_id(endpoint_id) {
             error!("trb indexing wrong endpoint id");
@@ -798,6 +799,14 @@ impl DeviceSlot {
         match self.get_trc(index, stream_id) {
             Some(trc) => {
                 trc.set_dequeue_pointer(GuestAddress(ptr));
+                // The DCS bit of the command is not optional: it tells us which
+                // cycle bit marks a live TRB from the new dequeue pointer on.
+                // Moving the pointer without it leaves our consumer cycle state
+                // stale, so the very first TRB the guest enqueues there reads as
+                // "not yet produced" and the endpoint stalls forever -- the guest
+                // then times out the transfer, resets the device and repeats.
+                // UAS error recovery drives this path on every retry.
+                trc.set_consumer_cycle_state(dequeue_cycle_state);
                 let mut ctx = self.get_device_context()?;
                 ctx.endpoint_context[index]
                     .set_tr_dequeue_pointer(DequeuePtr::new(GuestAddress(ptr)));

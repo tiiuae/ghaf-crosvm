@@ -6,11 +6,13 @@ use std::sync::Arc;
 use std::sync::MutexGuard;
 
 use base::info;
+use base::warn;
 use remain::sorted;
 use sync::Mutex;
 use thiserror::Error;
 use usb_util::DeviceSpeed;
 
+use super::event_ring::Error as EventRingError;
 use super::interrupter::Error as InterrupterError;
 use super::interrupter::Interrupter;
 use super::xhci_backend_device::BackendType;
@@ -134,9 +136,35 @@ impl UsbPort {
         );
     }
 
+    /// Announce the connection, tolerating a guest that is not listening yet.
+    ///
+    /// An uninitialized event ring is never fatal: it means the guest has not
+    /// set up (or is currently tearing down) its event ring, which is normal
+    /// while it boots and while it resets the controller. PORTSC already
+    /// carries the connection, and the guest reads PORTSC when it initializes,
+    /// so the device is still discoverable. Treating this as an error instead
+    /// takes down the whole controller by way of the fail handle.
+    fn announce_connection(&self) -> std::result::Result<(), InterrupterError> {
+        if let Err(reason) = self.send_device_connected_event() {
+            if matches!(
+                reason,
+                InterrupterError::AddEvent(EventRingError::Uninitialized)
+            ) {
+                warn!(
+                    "usb_hub: port {} connected while the guest event ring was down; \
+                     leaving the connection in PORTSC for the guest to find",
+                    self.port_id
+                );
+                return Ok(());
+            }
+            return Err(reason);
+        }
+        Ok(())
+    }
+
     fn reset(&self) -> std::result::Result<(), InterrupterError> {
         if self.is_attached() {
-            self.send_device_connected_event()?;
+            self.announce_connection()?;
         }
         Ok(())
     }
@@ -161,10 +189,21 @@ impl UsbPort {
             Some(DeviceSpeed::SuperPlus) => 5,
         };
         self.portsc.set_bits(speed_id << PORTSC_PORT_SPEED_SHIFT);
-        if let Err(reason) = self.send_device_connected_event() {
-            // The guest may not have initialized its event ring yet. Leave
-            // the port completely empty so a later hotplug retry can reuse
-            // it instead of leaking one occupied port per failed attempt.
+        // A device attached while the guest is still booting is genuinely
+        // connected, so keep it: announce_connection leaves the connection in
+        // PORTSC for the guest to find, and reset() re-announces on the host
+        // controller reset the guest performs during xHCI init.
+        //
+        // Discarding it instead leaves the caller to retry, and a caller that
+        // stops retrying before the guest is up loses the device for good:
+        // crosvm reports the port occupied while the guest never enumerated
+        // anything, and the port is never offered again. Measured on a
+        // boot-time USB disk, which loses that race every time -- the guest
+        // takes seconds to reach xHCI init.
+        if let Err(reason) = self.announce_connection() {
+            // A real failure. Leave the port completely empty so a later
+            // hotplug retry can reuse it instead of leaking one occupied port
+            // per failed attempt.
             *locked = None;
             self.clear_connection_state();
             return Err(reason);
