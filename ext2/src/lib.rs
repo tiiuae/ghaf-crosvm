@@ -11,17 +11,13 @@ mod arena;
 mod bitmap;
 mod blockgroup;
 mod builder;
-mod cache;
 mod fs;
 mod inode;
 mod superblock;
 mod xattr;
 
-pub use arena::FileMappingInfo;
 pub use blockgroup::BLOCK_SIZE;
 pub use builder::read_paths_file;
 pub use builder::Builder;
-pub use cache::cached_size;
-pub use cache::CachedMapping;
 pub use xattr::dump_xattrs;
 pub use xattr::set_xattr;

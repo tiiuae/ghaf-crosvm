@@ -7,8 +7,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs::File;
-use std::path::Path;
-use std::path::PathBuf;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -180,10 +178,6 @@ pub struct FileMappingInfo {
     pub length: usize,
     /// Offset in the file to start the mapping.
     pub file_offset: usize,
-    /// Path of the file relative to the root directory of the file system.
-    pub path: PathBuf,
-    /// Size of the file when it was mapped.
-    pub file_size: u64,
 }
 
 /// Memory arena backed by `base::MemoryMapping`.
@@ -237,8 +231,6 @@ impl<'a> Arena<'a> {
         length: usize,
         file: File,
         file_offset: usize,
-        path: &Path,
-        file_size: usize,
     ) -> Result<()> {
         self.reserve(mem_offset, length)?;
         self.mappings.borrow_mut().push(FileMappingInfo {
@@ -246,8 +238,6 @@ impl<'a> Arena<'a> {
             length,
             file: file.try_clone()?,
             file_offset,
-            path: path.to_path_buf(),
-            file_size: file_size as u64,
         });
 
         Ok(())

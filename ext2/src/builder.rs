@@ -4,18 +4,7 @@
 
 //! Provides structs and logic to build ext2 file system with configurations.
 
-use std::collections::HashSet;
-use std::ffi::CString;
-use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::fs::File;
-use std::io::Read;
-use std::io::Write;
-use std::ops::Range;
-use std::os::fd::AsRawFd;
-use std::os::fd::FromRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -31,13 +20,10 @@ use base::SharedMemory;
 
 use crate::arena::Arena;
 use crate::arena::FileMappingInfo;
-use crate::cache;
-use crate::cache::CachedMapping;
 use crate::fs::Ext2;
 use crate::BLOCK_SIZE;
 
 /// A struct to represent the configuration of an ext2 filesystem.
-#[derive(Clone)]
 pub struct Builder {
     /// The number of blocks per group.
     pub blocks_per_group: u32,
@@ -141,18 +127,13 @@ impl MemRegion {
     pub fn build_mmap_info(mut self) -> Result<MemRegionWithMappingInfo> {
         let arena = Arena::new(BLOCK_SIZE, &mut self.mem).context("failed to allocate arena")?;
         let mut ext2 = Ext2::new(&self.cfg, &arena).context("failed to create Ext2 struct")?;
-        if let Some(dir) = &self.cfg.root_dir {
+        if let Some(dir) = self.cfg.root_dir {
             ext2.copy_dirtree(&arena, dir, self.cfg.paths.as_deref())
                 .context("failed to copy directory tree")?;
         }
         ext2.copy_backup_metadata(&arena)
             .context("failed to copy metadata for backup")?;
-        let mut mapping_info = arena.into_mapping_info();
-        if let Some(dir) = &self.cfg.root_dir {
-            for info in &mut mapping_info {
-                info.path = info.path.strip_prefix(dir)?.to_path_buf();
-            }
-        }
+        let mapping_info = arena.into_mapping_info();
 
         self.mem
             .msync()
@@ -162,94 +143,6 @@ impl MemRegion {
             mapping_info,
         })
     }
-
-    /// Restores the image from a cache written by `MemRegionWithMappingInfo::write_cache` and
-    /// opens its files under `root_dir`. On failure the region is zeroed again.
-    pub fn restore(self, r: impl Read) -> Result<MemRegionWithMappingInfo> {
-        let res = self.restore_mappings(r);
-        if res.is_err() {
-            let _ = <dyn MappedRegion>::madvise(&self.mem, 0, self.mem.size(), libc::MADV_REMOVE);
-        }
-        Ok(MemRegionWithMappingInfo {
-            mem: self.mem,
-            mapping_info: res?,
-        })
-    }
-
-    fn restore_mappings(&self, r: impl Read) -> Result<Vec<FileMappingInfo>> {
-        let root = self.cfg.root_dir.as_deref().context("no root directory")?;
-        let root = File::open(root).with_context(|| format!("failed to open {:?}", root))?;
-        let paths: Option<HashSet<&OsStr>> = self
-            .cfg
-            .paths
-            .as_ref()
-            .map(|p| p.iter().map(|p| p.as_os_str()).collect());
-        let mut out = Vec::new();
-        let mut last: Option<(PathBuf, File)> = None;
-        for m in cache::read_cache(r, &self.cfg, &self.mem)? {
-            let mut c = m.path.components();
-            match c.next() {
-                Some(Component::Normal(top)) if paths.as_ref().is_none_or(|p| p.contains(top)) => {}
-                _ => bail!("{:?} is not in the paths", m.path),
-            }
-            if !c.all(|c| matches!(c, Component::Normal(_))) {
-                bail!("invalid path {:?}", m.path);
-            }
-            if m.file_offset
-                .checked_add(m.length)
-                .is_none_or(|end| end > m.file_size)
-            {
-                bail!("mapping of {:?} is past its end", m.path);
-            }
-            let file = match &last {
-                Some((p, f)) if *p == m.path => f.try_clone()?,
-                _ => {
-                    let f = open_beneath(&root, &m.path)
-                        .with_context(|| format!("failed to open {:?}", m.path))?;
-                    if f.metadata()?.len() != m.file_size {
-                        bail!("{:?} changed size", m.path);
-                    }
-                    last = Some((m.path.clone(), f.try_clone()?));
-                    f
-                }
-            };
-            out.push(FileMappingInfo {
-                mem_offset: m.mem_offset as usize,
-                length: m.length as usize,
-                file,
-                file_offset: m.file_offset as usize,
-                path: m.path,
-                file_size: m.file_size,
-            });
-        }
-        Ok(out)
-    }
-}
-
-/// Opens `path` under `dir` one component at a time without following any symlink, so a cached
-/// path cannot leave `dir`. openat2(RESOLVE_NO_SYMLINKS) would do this in one call, but systemd's
-/// RestrictSUIDSGID= makes openat2 fail with ENOSYS.
-fn open_beneath(dir: &File, path: &Path) -> Result<File> {
-    let mut cur = dir.try_clone()?;
-    let mut components = path.components().peekable();
-    while let Some(c) = components.next() {
-        let Component::Normal(name) = c else {
-            bail!("invalid path {:?}", path);
-        };
-        let name = CString::new(name.as_bytes())?;
-        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        if components.peek().is_some() {
-            flags |= libc::O_DIRECTORY;
-        }
-        // SAFETY: `cur` is an open descriptor and `name` a valid C string.
-        let fd = unsafe { libc::openat(cur.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: openat returned a new descriptor that nothing else owns.
-        cur = unsafe { File::from_raw_fd(fd) };
-    }
-    Ok(cur)
 }
 
 /// Memory regions where ext2 metadata were written with information of mmap operations to be done.
@@ -265,18 +158,6 @@ impl MemRegionWithMappingInfo {
             .context("failed to madvise(MADV_PAGEOUT)")
     }
 
-    /// Writes the image and `mappings` to `w` for `MemRegion::restore`. Only the `data` ranges of
-    /// the image are read.
-    pub fn write_cache(
-        &self,
-        w: impl Write,
-        cfg: &Builder,
-        data: &[Range<usize>],
-        mappings: &[CachedMapping],
-    ) -> Result<()> {
-        cache::write_cache(w, cfg, &self.mem, data, mappings)
-    }
-
     /// Do mmap and returns the memory region where ext2 was created.
     pub fn do_mmap(self) -> Result<MemoryMappingArena> {
         let mut mmap_arena = MemoryMappingArena::from(self.mem);
@@ -285,7 +166,6 @@ impl MemRegionWithMappingInfo {
             file,
             length,
             file_offset,
-            ..
         } in self.mapping_info
         {
             mmap_arena

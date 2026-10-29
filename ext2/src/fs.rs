@@ -13,6 +13,8 @@ use std::fs::DirEntry;
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use anyhow::anyhow;
 use anyhow::bail;
@@ -495,7 +497,6 @@ impl<'a> Ext2<'a> {
         arena: &'a Arena<'a>,
         block_num: usize,
         file: &File,
-        path: &Path,
         file_size: usize,
         mut file_offset: usize,
     ) -> Result<(Vec<BlockId>, usize)> {
@@ -517,8 +518,6 @@ impl<'a> Ext2<'a> {
                     length,
                     file.try_clone().context("failed to clone file")?,
                     file_offset,
-                    path,
-                    file_size,
                 )
                 .context("mmap for direct_block is already occupied")?;
             remaining -= length;
@@ -533,7 +532,6 @@ impl<'a> Ext2<'a> {
         arena: &'a Arena<'a>,
         indirect_table: BlockId,
         file: &File,
-        path: &Path,
         file_size: usize,
         file_offset: usize,
     ) -> Result<usize> {
@@ -548,7 +546,7 @@ impl<'a> Ext2<'a> {
         let block_num = length.div_ceil(BLOCK_SIZE);
 
         let (allocated_blocks, length) = self
-            .register_mmap_file(arena, block_num, file, path, file_size, file_offset)
+            .register_mmap_file(arena, block_num, file, file_size, file_offset)
             .context("failed to reserve mmap regions on indirect block")?;
 
         let slice = arena.allocate_slice(indirect_table, 0, 4 * block_num)?;
@@ -581,7 +579,7 @@ impl<'a> Ext2<'a> {
                 InodeBlock::NUM_DIRECT_BLOCKS,
             );
             let (allocated_blocks, len) = self
-                .register_mmap_file(arena, block_num, &file, path, file_size, 0)
+                .register_mmap_file(arena, block_num, &file, file_size, 0)
                 .context("failed to reserve mmap regions on direct block")?;
 
             block.set_direct_blocks(&allocated_blocks)?;
@@ -596,7 +594,7 @@ impl<'a> Ext2<'a> {
             used_blocks += 1;
 
             let length =
-                self.fill_indirect_block(arena, indirect_table, &file, path, file_size, written)?;
+                self.fill_indirect_block(arena, indirect_table, &file, file_size, written)?;
             written += length;
             used_blocks += length.div_ceil(BLOCK_SIZE);
         }
@@ -620,7 +618,7 @@ impl<'a> Ext2<'a> {
                 used_blocks += 1;
 
                 let length = self
-                    .fill_indirect_block(arena, indirect_table, &file, path, file_size, written)
+                    .fill_indirect_block(arena, indirect_table, &file, file_size, written)
                     .context("failed to indirect block for doubly-indirect table")?;
                 written += length;
                 used_blocks += length.div_ceil(BLOCK_SIZE);
@@ -844,17 +842,44 @@ fn dir_entries(dir: &Path, paths: Option<&[OsString]>) -> Result<Vec<DirEntry>> 
 
 /// Counts the blocks and inodes that copying `dir` (filtered by `paths`) allocates.
 fn count_usage(dir: &Path, paths: Option<&[OsString]>, root: bool) -> Result<(u64, u64)> {
-    let entries = dir_entries(dir, paths)?;
+    let mut entries = dir_entries(dir, paths)?;
     let mut names: Vec<OsString> = vec![".".into(), "..".into()];
     if root {
         names.push("lost+found".into());
+        entries.retain(|e| {
+            !(e.file_name() == "lost+found" && e.file_type().is_ok_and(|t| t.is_dir()))
+        });
     }
+    names.extend(entries.iter().map(DirEntry::file_name));
+    let (mut blocks, inodes) = if root {
+        par_entries_usage(&entries)?
+    } else {
+        entries_usage(&entries, &AtomicUsize::new(0))?
+    };
+    blocks += dir_blocks(&names);
+    Ok((blocks, inodes))
+}
+
+/// Walks the root's entries on several threads, so the cold metadata reads overlap.
+fn par_entries_usage(entries: &[DirEntry]) -> Result<(u64, u64)> {
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get().min(16));
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| s.spawn(|| entries_usage(entries, &next)))
+            .collect();
+        workers.into_iter().try_fold((0, 0), |(b, i), w| {
+            let (wb, wi) = w.join().map_err(|_| anyhow!("a size walker panicked"))??;
+            Ok((b + wb, i + wi))
+        })
+    })
+}
+
+/// Sums the usage of the entries claimed from `next` until none are left.
+fn entries_usage(entries: &[DirEntry], next: &AtomicUsize) -> Result<(u64, u64)> {
     let (mut blocks, mut inodes) = (0, 0);
-    for entry in entries {
+    while let Some(entry) = entries.get(next.fetch_add(1, Ordering::Relaxed)) {
         let ftype = entry.file_type()?;
-        if root && ftype.is_dir() && entry.file_name() == "lost+found" {
-            continue;
-        }
         inodes += 1;
         if ftype.is_dir() {
             let (b, i) = count_usage(&entry.path(), None, false)?;
@@ -877,9 +902,7 @@ fn count_usage(dir: &Path, paths: Option<&[OsString]>, root: bool) -> Result<(u6
         {
             blocks += 1;
         }
-        names.push(entry.file_name());
     }
-    blocks += dir_blocks(&names);
     Ok((blocks, inodes))
 }
 

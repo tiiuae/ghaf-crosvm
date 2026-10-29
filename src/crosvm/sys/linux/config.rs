@@ -294,7 +294,6 @@ pub struct PmemExt2Option {
     pub inodes_per_group: u32,
     pub size: Option<u64>,
     pub paths: Option<PathBuf>,
-    pub cache: Option<PathBuf>,
     pub ugid: (Option<u32>, Option<u32>),
     pub uid_map: String,
     pub gid_map: String,
@@ -311,7 +310,6 @@ impl Default for PmemExt2Option {
             inodes_per_group,
             size: None,
             paths: None,
-            cache: None,
             ugid: (ugid_cfg.uid, ugid_cfg.gid),
             uid_map: ugid_cfg.uid_map,
             gid_map: ugid_cfg.gid_map,
@@ -359,7 +357,6 @@ pub fn parse_pmem_ext2_option(param: &str) -> Result<PmemExt2Option, String> {
                     )
                 }
                 "paths" => opt.paths = Some(PathBuf::from(value)),
-                "cache" => opt.cache = Some(PathBuf::from(value)),
                 _ => return Err(format!("invalid `pmem-ext2` option: {kind}")),
             }
         }
@@ -1089,5 +1086,4 @@ mod tests {
         assert_eq!(opt.blocks_per_group, 32768);
         assert_eq!(opt.size, None);
     }
-
 }

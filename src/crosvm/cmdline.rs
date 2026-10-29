@@ -1695,9 +1695,6 @@ pub struct RunCommand {
     ///     paths=FILE - File listing absolute paths, one per line.
     ///       Only the top-level entries of PATH whose names match
     ///       their file names are copied.
-    ///     cache=FILE - Restore the image from FILE if it is a
-    ///       valid cache for these options, else build it and then
-    ///       write FILE.
     ///     uid=UID - uid of the mkfs process in the user
     ///       namespace created by minijail. (default: 0)
     ///     gid=GID - gid of the mkfs process in the user

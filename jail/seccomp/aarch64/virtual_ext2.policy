@@ -13,13 +13,11 @@ getrandom: 1
 lgetxattr: 1
 llistxattr: 1
 madvise: 1
-lseek: 1
 msync: 1
 mmap: arg2 in ~PROT_EXEC
 munmap: 1
 newfstatat: 1
 openat: arg3 in O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY
-read: 1
 readlinkat: 1
 recvfrom: 1
 recvmsg: 1

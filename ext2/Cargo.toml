@@ -12,7 +12,6 @@ enumn = { workspace = true }
 libc = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 zerocopy = { version = "0.8.13", features = ["derive"] }
-zstd = "0.13"
 
 [[example]]
 name = "mkfs"
