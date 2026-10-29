@@ -460,6 +460,8 @@ fn create_virtio_devices(
         });
         let (pmem_host_tube, pmem_device_tube) = Tube::pair().context("failed to create tube")?;
         add_control_tube(AnyControlTube::VmMsync(pmem_host_tube));
+        let (ready_host_tube, ready_tube) = Tube::pair().context("failed to create tube")?;
+        add_control_tube(AnyControlTube::PmemExt2Ready(ready_host_tube));
         devs.push((
             "pmem_ext2",
             create_pmem_ext2_device(
@@ -470,6 +472,7 @@ fn create_virtio_devices(
                 index,
                 vm_memory_client,
                 pmem_device_tube,
+                ready_tube,
                 worker_process_pids,
             )?,
         ));
@@ -3775,6 +3778,7 @@ fn process_vm_request(
         AnyControlTube::Fs(t) => add_tubes.push(TaggedControlTube::Fs(t)),
         AnyControlTube::Gpu(_) => panic!("gpu tube hotplug not supported"),
         AnyControlTube::IrqTube(t) => add_irq_control_tubes.push(t),
+        AnyControlTube::PmemExt2Ready(_) => panic!("pmem-ext2 tube hotplug not supported"),
         AnyControlTube::PvClock(_) => panic!("pv-clock tube hotplug not supported"),
         AnyControlTube::Snd(_) => panic!("snd tube hotplug not supported"),
         AnyControlTube::Vm(t) => add_tubes.push(TaggedControlTube::Vm(t)),
@@ -4316,6 +4320,7 @@ fn run_control(
     let mut irq_control_tubes = Vec::new();
     let mut vm_memory_control_tubes = Vec::new();
     let mut control_tubes = Vec::new();
+    let mut pmem_ext2_ready_tubes = Vec::new();
     for t in all_control_tubes {
         match t {
             #[cfg(feature = "balloon")]
@@ -4335,6 +4340,7 @@ fn run_control(
             #[cfg(not(feature = "gpu"))]
             AnyControlTube::Gpu(_) => unreachable!(),
             AnyControlTube::IrqTube(t) => irq_control_tubes.push(t),
+            AnyControlTube::PmemExt2Ready(t) => pmem_ext2_ready_tubes.push(t),
             #[cfg(feature = "pvclock")]
             AnyControlTube::PvClock(t) => {
                 assert!(pvclock_host_tube.is_none());
@@ -4726,6 +4732,12 @@ fn run_control(
             }
         })
         .unwrap();
+
+    for t in pmem_ext2_ready_tubes {
+        if let Err(e) = t.recv::<()>() {
+            warn!("pmem-ext2 image not ready: {}", e);
+        }
+    }
 
     vcpu_thread_barrier.wait();
 

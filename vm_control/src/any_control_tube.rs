@@ -19,6 +19,8 @@ pub enum AnyControlTube {
     Gpu(Tube),
     /// Receives `IrqHandlerRequest`.
     IrqTube(Tube),
+    /// Receives `()` once the pmem-ext2 image is mapped into the guest.
+    PmemExt2Ready(Tube),
     // Sends `PvClockCommand`.
     PvClock(Tube),
     // Sends `SndControlCommand`.

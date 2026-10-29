@@ -1346,6 +1346,7 @@ fn run_control(
             #[cfg(not(feature = "gpu"))]
             AnyControlTube::Gpu(_) => unreachable!(),
             AnyControlTube::IrqTube(t) => irq_control_tubes.push(t),
+            AnyControlTube::PmemExt2Ready(_) => unreachable!(),
             #[cfg(feature = "pvclock")]
             AnyControlTube::PvClock(t) => {
                 assert!(pvclock_host_tube.is_none());

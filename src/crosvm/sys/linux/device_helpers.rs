@@ -1320,6 +1320,7 @@ pub fn create_pmem_ext2_device(
     index: usize,
     vm_memory_client: VmMemoryClient,
     pmem_device_tube: Tube,
+    ready_tube: Tube,
     worker_process_pids: &mut BTreeSet<Pid>,
 ) -> DeviceResult {
     let mut builder = ext2::Builder {
@@ -1372,6 +1373,7 @@ pub fn create_pmem_ext2_device(
         mapping_address,
         vm_memory_client,
         mkfs_tube,
+        ready_tube,
         &opts.path,
         &opts.ugid,
         (&opts.uid_map, &opts.gid_map),

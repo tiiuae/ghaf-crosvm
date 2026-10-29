@@ -55,6 +55,7 @@ pub fn launch(
     mapping_address: GuestAddress,
     vm_memory_client: VmMemoryClient,
     device_tube: Tube, // Connects to a virtio device to send a memory slot number.
+    ready_tube: Tube,
     path: &Path,
     ugid: &(Option<u32>, Option<u32>),
     ugid_map: (&str, &str),
@@ -91,6 +92,7 @@ pub fn launch(
         shm.as_raw_descriptor(),
         vm_memory_client.as_raw_descriptor(),
         device_tube.as_raw_descriptor(),
+        ready_tube.as_raw_descriptor(),
     ];
     let mut pids = Vec::new();
     let mut cache_files = None;
@@ -121,6 +123,7 @@ pub fn launch(
             vm_memory_client,
             mapping_address,
             device_tube,
+            ready_tube,
             builder,
             shm,
             cache_files,
@@ -189,6 +192,7 @@ fn mkfs_callback(
     mem_client: VmMemoryClient,
     mapping_address: GuestAddress,
     device_tube: Tube, // Connects to a virtio device to send a memory slot number.
+    ready_tube: Tube,
     builder: ext2::Builder,
     shm: SharedMemory,
     cache: Option<(Option<File>, File)>, // (existing cache, pipe to the cache writer)
@@ -243,6 +247,9 @@ fn mkfs_callback(
     device_tube
         .send(&slot)
         .context("failed to send VmMemoryRequest::RegisterMemory")?;
+    ready_tube
+        .send(&())
+        .context("failed to report the pmem-ext2 image ready")?;
 
     // The cache is written only after the VM has its image, so it does not delay the boot.
     if let Some((w, mappings, data)) = cache_out {
