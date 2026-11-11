@@ -275,6 +275,8 @@ pub struct KvmVm {
     vm: SafeDescriptor,
     guest_mem: GuestMemory,
     mem_regions: Mutex<BTreeMap<MemSlot, Box<dyn MappedRegion>>>,
+    #[cfg(target_arch = "aarch64")]
+    readonly_regions: Arc<Mutex<BTreeMap<MemSlot, (u64, u64)>>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
     mem_slot_gaps: Mutex<BinaryHeap<Reverse<MemSlot>>>,
     caps: KvmVmCaps,
@@ -305,6 +307,8 @@ impl KvmVm {
             vm: vm_descriptor,
             guest_mem,
             mem_regions: Default::default(),
+            #[cfg(target_arch = "aarch64")]
+            readonly_regions: Default::default(),
             mem_slot_gaps: Default::default(),
             caps: Default::default(),
             force_disable_readonly_mem: cfg.force_disable_readonly_mem,
@@ -366,6 +370,8 @@ impl KvmVm {
             id,
             cap_kvmclock_ctrl: self.caps.kvmclock_ctrl,
             run_mmap: Arc::new(run_mmap),
+            #[cfg(target_arch = "aarch64")]
+            readonly_regions: self.readonly_regions.clone(),
         })
     }
 
@@ -684,12 +690,20 @@ impl Vm for KvmVm {
         if self.guest_mem.range_overlap(guest_addr, end_addr) {
             return Err(Error::new(ENOSPC));
         }
+        #[cfg(target_arch = "aarch64")]
+        if read_only && !self.force_disable_readonly_mem {
+            self.enable_readonly_cache_maintenance()?;
+        }
         let mut regions = self.mem_regions.lock();
         let mut gaps = self.mem_slot_gaps.lock();
         let slot = match gaps.pop() {
             Some(gap) => gap.0,
             None => (regions.len() + self.guest_mem.num_regions() as usize) as MemSlot,
         };
+
+        // Keep the vCPU's cache-maintenance view in sync with KVM's memslots.
+        #[cfg(target_arch = "aarch64")]
+        let mut readonly_regions = self.readonly_regions.lock();
 
         // SAFETY:
         // Safe because we check that the given guest address is valid and has no overlaps. We also
@@ -714,6 +728,10 @@ impl Vm for KvmVm {
             return Err(e);
         }
         regions.insert(slot, mem);
+        #[cfg(target_arch = "aarch64")]
+        if read_only && !self.force_disable_readonly_mem {
+            readonly_regions.insert(slot, (guest_addr.offset(), end_addr.offset()));
+        }
         Ok(slot)
     }
 
@@ -781,6 +799,8 @@ impl Vm for KvmVm {
 
     fn remove_memory_region(&self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
         let mut regions = self.mem_regions.lock();
+        #[cfg(target_arch = "aarch64")]
+        let mut readonly_regions = self.readonly_regions.lock();
         if !regions.contains_key(&slot) {
             return Err(Error::new(ENOENT));
         }
@@ -799,6 +819,8 @@ impl Vm for KvmVm {
             )?;
         }
         self.mem_slot_gaps.lock().push(Reverse(slot));
+        #[cfg(target_arch = "aarch64")]
+        readonly_regions.remove(&slot);
         // This remove will always succeed because of the contains_key check above.
         Ok(regions.remove(&slot).unwrap())
     }
@@ -960,6 +982,8 @@ pub struct KvmVcpu {
     id: usize,
     cap_kvmclock_ctrl: bool,
     run_mmap: Arc<MemoryMapping>,
+    #[cfg(target_arch = "aarch64")]
+    readonly_regions: Arc<Mutex<BTreeMap<MemSlot, (u64, u64)>>>,
 }
 
 impl Vcpu for KvmVcpu {
@@ -1040,6 +1064,10 @@ impl Vcpu for KvmVcpu {
 
         // Check for architecture-specific VM exit reasons first in case the architecture wants to
         // override the default handling.
+        #[cfg(target_arch = "aarch64")]
+        if run.exit_reason == KVM_EXIT_ARM_NISV {
+            return self.handle_readonly_cache_maintenance(run);
+        }
         if let Some(vcpu_exit) = self.handle_vm_exit_arch(run) {
             return Ok(vcpu_exit);
         }
