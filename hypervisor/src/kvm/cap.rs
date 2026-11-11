@@ -123,6 +123,8 @@ pub enum KvmCap {
     ArmProtectedVm = KVM_CAP_ARM_PROTECTED_VM,
     X86ProtectedVm = KVM_CAP_X86_PROTECTED_VM,
     ArmMte = KVM_CAP_ARM_MTE,
+    ArmNisvToUser = KVM_CAP_ARM_NISV_TO_USER,
+    ArmInjectExtDabt = KVM_CAP_ARM_INJECT_EXT_DABT,
     #[cfg(target_arch = "x86_64")]
     BusLockDetect = KVM_CAP_X86_BUS_LOCK_EXIT,
     // TODO(b/388092267): use upstream cap when available

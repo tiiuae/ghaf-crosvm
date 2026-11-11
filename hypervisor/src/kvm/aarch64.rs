@@ -281,7 +281,70 @@ impl VmAArch64 for KvmVm {
     }
 }
 
+impl KvmVm {
+    pub(crate) fn enable_readonly_cache_maintenance(&self) -> Result<()> {
+        if !self.check_raw_capability(KvmCap::ArmNisvToUser)
+            || !self.check_raw_capability(KvmCap::ArmInjectExtDabt)
+        {
+            return Err(Error::new(ENOTSUP));
+        }
+        // SAFETY: this VM capability has no pointer arguments.
+        unsafe { self.enable_raw_capability(KvmCap::ArmNisvToUser, 0, &[0; 4])? };
+        Ok(())
+    }
+}
+
+fn is_readonly_cache_maintenance(
+    esr_iss: u64,
+    fault_ipa: u64,
+    pstate: u64,
+    regions: impl Iterator<Item = (u64, u64)>,
+) -> bool {
+    const ESR_CM: u64 = 1 << 8;
+    const PSTATE_NRW: u64 = 1 << 4;
+    pstate & PSTATE_NRW == 0
+        && esr_iss & ESR_CM != 0
+        && regions
+            .into_iter()
+            .any(|(start, end)| start <= fault_ipa && fault_ipa < end)
+}
+
 impl KvmVcpu {
+    pub(crate) fn handle_readonly_cache_maintenance(&self, run: &kvm_run) -> Result<VcpuExit> {
+        // SAFETY: the caller checked KVM_EXIT_ARM_NISV before reading this union member.
+        let fault = unsafe { run.__bindgen_anon_1.arm_nisv };
+        let regions = self.readonly_regions.lock();
+        if !is_readonly_cache_maintenance(
+            fault.esr_iss,
+            fault.fault_ipa,
+            self.get_one_reg(VcpuRegAArch64::Pstate)?,
+            regions.values().copied(),
+        ) {
+            let mut events = kvm_vcpu_events::new_zeroed();
+            // SAFETY: these ioctls use a valid vCPU fd and an ABI-sized events structure.
+            if unsafe { ioctl_with_mut_ref(self, KVM_GET_VCPU_EVENTS, &mut events) } != 0 {
+                return errno_result();
+            }
+            events.exception.ext_dabt_pending = 1;
+            // SAFETY: events preserves the kernel state read above and uses the ARM64 ABI.
+            if unsafe { ioctl_with_ref(self, KVM_SET_VCPU_EVENTS, &events) } != 0 {
+                return errno_result();
+            }
+            return Err(Error::new(libc::EAGAIN));
+        }
+
+        // DAX executable mappings invalidate the instruction cache. ARM reports this as a
+        // write fault on a read-only memslot, but there can be no guest-dirty data here.
+        // esr_iss excludes ESR.IL; the AArch64 PSTATE check above guarantees four bytes.
+        let pc = self.get_one_reg(VcpuRegAArch64::Pc)?;
+        self.set_one_reg(
+            VcpuRegAArch64::Pc,
+            pc.checked_add(4).ok_or(Error::new(EINVAL))?,
+        )?;
+        // The exit is fully handled; let the existing retry path re-enter KVM.
+        Err(Error::new(libc::EAGAIN))
+    }
+
     /// Handles a `KVM_EXIT_SYSTEM_EVENT` with event type `KVM_SYSTEM_EVENT_RESET` with the given
     /// event flags and returns the appropriate `VcpuExit` value for the run loop to handle.
     ///
@@ -1000,6 +1063,46 @@ pub(super) fn chip_to_kvm_chip(chip: IrqSourceChip) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readonly_cache_maintenance_boundaries() {
+        let regions = [(0x1000, 0x2000)];
+        for address in [0x1000, 0x1fff] {
+            assert!(is_readonly_cache_maintenance(
+                0x147,
+                address,
+                0,
+                regions.into_iter()
+            ));
+        }
+        for address in [0xfff, 0x2000, u64::MAX] {
+            assert!(!is_readonly_cache_maintenance(
+                0x147,
+                address,
+                0,
+                regions.into_iter()
+            ));
+        }
+        assert!(!is_readonly_cache_maintenance(
+            0x147,
+            0x1000,
+            1 << 4,
+            regions.into_iter()
+        ));
+        // A normal store must receive an abort, even inside the read-only slot.
+        assert!(!is_readonly_cache_maintenance(
+            0x47,
+            0x1000,
+            0,
+            regions.into_iter()
+        ));
+        assert!(!is_readonly_cache_maintenance(
+            0x147,
+            0x1000,
+            0,
+            [].into_iter()
+        ));
+    }
 
     #[test]
     fn system_timer_register_mixup() {
