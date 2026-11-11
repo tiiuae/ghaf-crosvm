@@ -834,6 +834,8 @@ impl arch::LinuxArch for AArch64 {
         let mmio_bus = Arc::new(devices::Bus::new(BusType::Mmio));
 
         #[cfg(target_os = "linux")]
+        let mut nvidia_dce_device = None;
+        #[cfg(target_os = "linux")]
         let nvidia_dce_irq = if let Some(host_device) = components.nvidia_dce_host.take() {
             let event_memory = SharedMemory::new("nvidia-dce-event", NVIDIA_DCE_EVENT_PAYLOAD_SIZE)
                 .map_err(Error::BuildNvidiaDcePayload)?;
@@ -866,9 +868,7 @@ impl arch::LinuxArch for AArch64 {
             mmio_bus
                 .insert(dce.clone(), NVIDIA_DCE_MMIO_BASE, NVIDIA_DCE_MMIO_SIZE)
                 .map_err(Error::RegisterNvidiaDce)?;
-            dce.lock()
-                .start_event_thread()
-                .map_err(Error::StartNvidiaDce)?;
+            nvidia_dce_device = Some(dce);
             Some(irq)
         } else {
             None
@@ -1239,6 +1239,15 @@ impl arch::LinuxArch for AArch64 {
         .map_err(Error::InitVmError)?;
 
         let vm_request_tubes = vec![vmwdt_host_tube, vcpufreq_host_tube];
+
+        // Minijail requires a single-threaded parent while forking device processes.
+        // Start the DCE relay only after all architecture devices have been created.
+        #[cfg(target_os = "linux")]
+        if let Some(dce) = nvidia_dce_device {
+            dce.lock()
+                .start_event_thread()
+                .map_err(Error::StartNvidiaDce)?;
+        }
 
         Ok(RunnableLinuxVm {
             vm,
