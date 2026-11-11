@@ -1350,7 +1350,9 @@ pub fn create_pmem_ext2_device(
                 Alloc::PmemDevice(index),
                 format!("pmem_ext2_image_{index}"),
                 AllocOptions::new()
-                .top_down(true)
+                // Keep the store within the guest kernel's linear mapping range,
+                // as with regular PMEM devices.
+                .top_down(false)
                 .prefetchable(true)
                 // 2MB alignment for DAX
                 // cf. https://docs.pmem.io/persistent-memory/getting-started-guide/creating-development-environments/linux-environments/advanced-topics/i-o-alignment-considerations#verifying-io-alignment
